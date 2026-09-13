@@ -199,6 +199,11 @@ int           GWStream_PeerGone(const GWStream *s);
 
 /* 0 when unknown or plain, otherwise 12 or 13. */
 int           GWStream_TlsVersion(const GWStream *s);
+/* The protocol version the client offered in its ClientHello, in network
+ * byte order (0x0300 = SSL 3.0, 0x0301 = TLS 1.0, etc.). 0 when unknown,
+ * plain, or before the handshake has started. Only meaningful on the server
+ * side (MITM'd CONNECT). */
+unsigned int  GWStream_ServerVersion(const GWStream *s);
 const char   *GWStream_ErrorText(const GWStream *s);
 
 /*

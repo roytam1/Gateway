@@ -208,6 +208,23 @@ static int connecting_count(int wayback)
     return n;
 }
 
+/*
+ * Format a TLS version number (in network byte order) as a human-readable
+ * string. The version comes from the client's ClientHello and tells us what
+ * the browser thinks it is speaking. Returns a static string.
+ */
+static const char *tls_version_name(unsigned int ver)
+{
+    switch (ver) {
+    case 0x0300: return "SSL 3.0";
+    case 0x0301: return "TLS 1.0";
+    case 0x0302: return "TLS 1.1";
+    case 0x0303: return "TLS 1.2";
+    case 0x0304: return "TLS 1.3";
+    default:     return NULL;
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* Idle upstream connections                                           */
 /* ------------------------------------------------------------------ */
@@ -1358,6 +1375,7 @@ static void step_mitm_wait(GWHttpSession *s)
         {
             int         err = GWStream_ServerError(&s->cli);
             const char *why = "";
+            char        why_buf[128];
 
             /*
              * 3 is the one every Internet Explorer produces, and it is not
@@ -1375,8 +1393,18 @@ static void step_mitm_wait(GWHttpSession *s)
             if (err == 3)
                 why = ": it sent an SSL 2.0-style hello -- untick "
                       "\"Use SSL 2.0\" in Internet Options > Advanced";
-            else if (err == 512 + 70 || err == 256 + 70)
-                why = ": protocol_version alert -- no version in common";
+            else if (err == 512 + 70 || err == 256 + 70) {
+                unsigned int ver = GWStream_ServerVersion(&s->cli);
+                const char *name = tls_version_name(ver);
+                if (name != NULL)
+                    snprintf(why_buf, sizeof why_buf,
+                        ": %s offered, protocol_version alert", name);
+                else
+                    snprintf(why_buf, sizeof why_buf,
+                        ": client version 0x%04X, protocol_version alert",
+                        ver);
+                why = why_buf;
+            }
             else if (err == 16)
                 why = ": no cipher suite in common (a 40-bit browser?)";
             else if (err == 4)
