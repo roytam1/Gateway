@@ -1,4 +1,5 @@
 /* Automatically generated code; do not modify directly. */
+/* Gateway: two hash gates below carry PATCHES.md §22 (hash_skip). */
 
 #include <stddef.h>
 #include <stdint.h>
@@ -1580,7 +1581,15 @@ br_ssl_hs_server_run(void *t0ctx)
 		}
 		memcpy((unsigned char *)ENG + addr, ENG->hbuf_in, clen);
 		if (ENG->record_type_in == BR_SSL_HANDSHAKE) {
-			br_multihash_update(&ENG->mhash, ENG->hbuf_in, clen);
+			/* Gateway §22: skip re-hashed rewritten V2 hello. */
+			if (ENG->hash_skip >= clen) {
+				ENG->hash_skip -= clen;
+			} else {
+				br_multihash_update(&ENG->mhash,
+					ENG->hbuf_in + ENG->hash_skip,
+					clen - ENG->hash_skip);
+				ENG->hash_skip = 0;
+			}
 		}
 		T0_PUSH(addr + (uint32_t)clen);
 		T0_PUSH(len - (uint32_t)clen);
@@ -1598,7 +1607,12 @@ br_ssl_hs_server_run(void *t0ctx)
 
 		x = *ENG->hbuf_in ++;
 		if (ENG->record_type_in == BR_SSL_HANDSHAKE) {
-			br_multihash_update(&ENG->mhash, &x, 1);
+			/* Gateway §22: skip re-hashed rewritten V2 hello. */
+			if (ENG->hash_skip > 0) {
+				ENG->hash_skip --;
+			} else {
+				br_multihash_update(&ENG->mhash, &x, 1);
+			}
 		}
 		T0_PUSH(x);
 		ENG->hlen_in --;
