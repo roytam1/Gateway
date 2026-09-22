@@ -25,6 +25,7 @@ as confusing as it sounds, so heed the warning.
 | `http_enabled` | `1` | Run Module 1, the HTTP/TLS proxy on `http_port`. |
 | `mail_enabled` | `1` | Run Module 2, the IMAP, POP3 and SMTP splices. Also governs the OAuth token refresher, which exists only to serve them. |
 | `wayback_enabled` | `1` | Run Module 3, the Internet Archive proxy on `wayback_port`. |
+| `tunnel_enabled` | `0` | Run the generic TLS tunnel on `tunnel_local_port`. Off by default: unlike the other modules it forwards whatever bytes the local port receives, so switch it on deliberately. |
 | `log_file` | `0` | Mirror the log window to a file. `1` (or `yes`/`on`) writes to **System Folder : Application Support : Gateway : Gateway Log.txt**, creating both folders if needed. Lines are appended across runs and written as they happen rather than buffered, so the tail survives a crash. The window keeps only the last 200 lines, which one slow page load can exceed, so this is the way to capture a whole session. |
 | `max_connects` | `8` | How many upstream connections may be *opening* at once for ordinary live-web sessions, clamped to 8. |
 | `wayback_connects` | `1` | The same cap for sessions served from the Internet Archive, counted separately so neither starves the other. It is low because a burst of new connections from one address is exactly what the archive's rate limiter refuses, logged as `connect failed [failed, OT 61, ...]`. Gateway runs a single cooperative thread, so concurrent TLS handshakes do not overlap anyway -- they take turns on one CPU -- and the connection pool recovers the throughput, since a reused connection skips the handshake entirely. |
@@ -179,3 +180,35 @@ against the account once is the easiest route — and extract it with
 `tools/extract-refresh-token.py`, which also prints the matching `client_id`
 and scope. Note that a token stored by that proxy is encrypted: a value
 beginning `gAAAAA` is ciphertext, not a token.
+
+## Tunnel
+
+A generic relay for one TCP stream:
+
+```
+local_app --plain--> :tunnel_local_port --TLS--> [proxy] --> remote:port
+```
+
+The local application speaks plaintext to Gateway; Gateway opens the far leg
+— directly, or through a forward proxy — upgrades it to TLS when `tunnel_tls`
+is set, and splices bytes both ways until either side closes. The far side
+unwraps TLS (stunnel and friends) and hands the stream onward. For SSH that
+means the SSH client points at `tunnel_local_port` and authenticates to sshd
+exactly as if the tunnel were not there.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `tunnel_local_port` | `2222` | Where the local application connects. |
+| `tunnel_remote_host` | — | The far endpoint. Required; without it clients are dropped and the log says so. This name is also the TLS SNI and the certificate identity, even when a proxy moved the bytes. |
+| `tunnel_remote_port` | `443` | The far port. |
+| `tunnel_tls` | `1` | Wrap the far leg in TLS. `0` relays plaintext — only for a far leg that is already safe. |
+| `tunnel_proxy` | `none` | `none`, `http` (CONNECT, with `Proxy-Authorization` when a user is set) or `socks5` (no-auth only). Anything else drops the client and logs the valid values. |
+| `tunnel_proxy_host` | — | The proxy. Required unless `tunnel_proxy` is `none`. |
+| `tunnel_proxy_port` | `8080` / `1080` | The proxy port: `8080` for `http`, `1080` for `socks5`. Set explicitly to override. |
+| `tunnel_proxy_user`, `tunnel_proxy_pass` | empty | HTTP proxy credentials (Basic). A SOCKS5 login is not implemented: setting one refuses the connection loudly rather than connecting anonymously. |
+
+Up to four sessions run at once; surplus clients wait in the listen backlog.
+There is no idle timeout on an established splice — an SSH session sits quiet
+for hours — so a slot is held until EOF or an error. The tunnel performs no
+local authentication: anything that can reach the local port can use it, so
+keep that port behind the machine's own boundary.

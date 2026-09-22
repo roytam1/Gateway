@@ -63,6 +63,32 @@ oauth_client_secret =
 refresh_token       = paste-your-refresh-token-here
 
 
+# ---------------------------------------------------------------- Tunnel
+#
+# A generic TLS tunnel: a local application connects in plaintext and Gateway
+# carries the far leg, optionally through a forward proxy, optionally in TLS:
+#
+#   local_app --plain--> :tunnel_local_port --TLS--> [proxy] --> remote:port
+#
+# For SSH: point the client at tunnel_local_port; the far side unwraps TLS
+# (stunnel and friends) and hands the SSH stream to sshd.
+
+tunnel_enabled      = 0
+tunnel_local_port   = 2222
+tunnel_remote_host  = ssh.example.com
+tunnel_remote_port  = 443
+tunnel_tls          = 1
+
+# None of: tunnel_proxy = none | http | socks5. http sends CONNECT (with
+# Proxy-Authorization when tunnel_proxy_user is set); socks5 is no-auth only.
+# tunnel_proxy_port defaults to 8080 for http, 1080 for socks5.
+# tunnel_proxy        = none
+# tunnel_proxy_host   = proxy.example.com
+# tunnel_proxy_port   = 8080
+# tunnel_proxy_user   =
+# tunnel_proxy_pass   =
+
+
 # Any other provider: set provider = custom and fill these in.
 #
 # provider            = custom
