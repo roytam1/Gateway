@@ -88,6 +88,14 @@
 #define GW_POOL_SIZE    6
 #define GW_POOL_IDLE    (45 * 60)   /* ticks: drop after 45 seconds idle */
 #define GW_IDLE_TIMEOUT (45 * 60)           /* ticks: 45 seconds */
+/*
+ * How much longer a backpressured session may live with no byte moving either
+ * way. Four further windows: about three minutes of complete standstill. A
+ * slow-but-alive client resets the allowance every time any byte moves; only
+ * a client that is gone without closing runs it out. See the idle check in
+ * session_step().
+ */
+#define GW_IDLE_GRACE   (4 * GW_IDLE_TIMEOUT)
 
 typedef enum {
     kHPFree = 0,
@@ -172,11 +180,25 @@ typedef struct {
     char          mitmHost[GW_MAX_HOST];
     UInt16        mitmPort;
 
+    /*
+     * Tunnel accounting. Bytes forwarded client->upstream and bytes received
+     * upstream->client once kHPTunnel is up, logged when the tunnel ends, so
+     * a stall can be placed: nothing sent, request sent but unanswered, or
+     * answered but unread. The forward path never touches these.
+     */
+    int           tunneled;
+    long          tunC2u;
+    long          tunU2c;
+
     long          bodyBytes;
     long          bodyCap;                  /* 0 means no ceiling */
     long          reqBodyLeft;
     int           status;
     unsigned long lastActivity;
+    /* When the idle exemption below started covering this session; 0 while
+     * bytes are moving. Bounds waiting_on_client so an abandoned transfer
+     * cannot hold its slot forever. */
+    unsigned long exemptAt;
 } GWHttpSession;
 
 typedef struct {
@@ -857,6 +879,17 @@ static void step_recv_request(GWHttpSession *s)
     }
 
     if (s->req.shape == kGWShapeConnect) {
+        /*
+         * Name the far end for the log lines below. The forward path records
+         * this in session_start_upstream(); a CONNECT opens its upstream
+         * directly, so without this every tunnel failure would read
+         * "upstream" with no address -- which is the whole diagnosis when
+         * only some origins stall.
+         */
+        gw_copy_n(s->upHost, sizeof(s->upHost), s->req.url.host,
+                  strlen(s->req.url.host));
+        s->upPort = s->req.url.port;
+        s->upTls = 0;
         if (!GWStream_ConnectPlain(&s->up, s->req.url.host, s->req.url.port)) {
             session_fail(s, "HTTP/1.0 502 Bad Gateway\r\n"
                             "Connection: close\r\n\r\n",
@@ -1398,12 +1431,18 @@ static void step_tunnel_connect(GWHttpSession *s)
         "HTTP/1.0 200 Connection Established\r\n\r\n";
 
     if (!session_queue(s, kEstablished, sizeof(kEstablished) - 1)) {
+        gw_log("#%ld dropping a CONNECT: its 200 would not fit", s->id);
         s->state = kHPDone;
         return;
     }
     {
         int flushed = session_flush(s);
-        if (flushed < 0) { s->state = kHPDone; return; }
+        if (flushed < 0) {
+            gw_log("#%ld client gone while sending 200 Connection Established",
+                   s->id);
+            s->state = kHPDone;
+            return;
+        }
         if (flushed == 0) return;
     }
     /*
@@ -1464,6 +1503,7 @@ static void step_tunnel_connect(GWHttpSession *s)
 
     gw_log("#%ld tunnel open to %s:%u", s->id, s->req.url.host,
            (unsigned)s->req.url.port);
+    s->tunneled = 1;
     s->state = kHPTunnel;
 }
 
@@ -1570,15 +1610,24 @@ static void step_mitm_wait(GWHttpSession *s)
 
 static void step_tunnel(GWHttpSession *s)
 {
+    char why[320];
     long n;
 
     /* client -> upstream: drain the leftover request bytes, then read more */
     if (s->cheadSent < s->cheadLen) {
         n = GWStream_Write(&s->up, s->chead + s->cheadSent,
                            s->cheadLen - s->cheadSent);
-        if (n < 0) { s->state = kHPDone; return; }
+        if (n < 0) {
+            gw_log("#%ld %s (tunnel c->u %ld u->c %ld)", s->id,
+                   upstream_why(s, "tunnel write to upstream failed",
+                                why, sizeof(why)),
+                   s->tunC2u, s->tunU2c);
+            s->state = kHPDone;
+            return;
+        }
         if (n > 0) {
             s->cheadSent += (size_t)n;
+            s->tunC2u += n;
             s->lastActivity = GWNet_Ticks();
         }
     } else {
@@ -1588,21 +1637,50 @@ static void step_tunnel(GWHttpSession *s)
             s->cheadSent = 0;
             s->lastActivity = GWNet_Ticks();
         } else if (n == -2) {
+            /*
+             * Log the half-close once: the EOF is sticky, so this arm runs
+             * every tick until the upstream goes away, and a line per tick
+             * would bury the log.
+             */
+            if (s->up.state == kGWStreamReady)
+                gw_log("#%ld client half-closed, closing upstream to %s:%u "
+                       "(tunnel c->u %ld u->c %ld)",
+                       s->id, s->upHost, (unsigned)s->upPort,
+                       s->tunC2u, s->tunU2c);
             GWStream_Close(&s->up);
         } else if (n == -1) {
+            gw_log("#%ld tunnel closing: client connection broke "
+                   "(c->u %ld u->c %ld)",
+                   s->id, s->tunC2u, s->tunU2c);
             s->state = kHPDone;
             return;
         }
     }
 
     /* upstream -> client */
-    if (session_flush(s) < 0) { s->state = kHPDone; return; }
+    if (session_flush(s) < 0) {
+        gw_log("#%ld tunnel closing: client stopped reading "
+               "(c->u %ld u->c %ld)",
+               s->id, s->tunC2u, s->tunU2c);
+        s->state = kHPDone;
+        return;
+    }
     if (s->outLen == 0) {
         n = GWStream_Read(&s->up, s->raw, (size_t)GW_RAW_MAX);
         if (n > 0) {
             session_queue(s, s->raw, (size_t)n);
+            s->tunU2c += n;
             s->lastActivity = GWNet_Ticks();
-        } else if (n == -2 || n == -1) {
+        } else if (n == -2) {
+            gw_log("#%ld tunnel: %s:%u closed its side (c->u %ld u->c %ld)",
+                   s->id, s->upHost, (unsigned)s->upPort,
+                   s->tunC2u, s->tunU2c);
+            s->state = kHPFlushAndClose;
+        } else if (n == -1) {
+            gw_log("#%ld %s (tunnel c->u %ld u->c %ld)", s->id,
+                   upstream_why(s, "tunnel read from upstream failed",
+                                why, sizeof(why)),
+                   s->tunC2u, s->tunU2c);
             s->state = kHPFlushAndClose;
         }
     }
@@ -1634,10 +1712,36 @@ static void session_step(GWHttpSession *s)
 
         if (!waiting_on_client) {
             gw_log("#%ld idle timeout", s->id);
+            if (s->tunneled)
+                gw_log("#%ld tunnel quiet 45s: c->u %ld bytes, u->c %ld bytes",
+                       s->id, s->tunC2u, s->tunU2c);
             s->state = kHPDone;
         } else {
-            s->lastActivity = GWNet_Ticks();
+            /*
+             * Still backpressured, so allow more time -- but not forever. A
+             * slow client moves some byte inside every window, which refreshes
+             * lastActivity above and zeroes the allowance below. No movement
+             * across the whole grace period means the client is not slow but
+             * gone without closing: a downloader timing out and abandoning
+             * the socket, whose unread response then holds `out` full.
+             * Refreshing the clock here unconditionally, as this used to do,
+             * kept one abandoned transfer's slot wedged for good -- and with
+             * max_sessions at 12, a handful of them wedges later browsing.
+             */
+            unsigned long now = GWNet_Ticks();
+
+            if (s->exemptAt == 0) s->exemptAt = now;
+            if (now - s->exemptAt > GW_IDLE_GRACE) {
+                gw_log("#%ld client stalled, dropping (%u bytes unsent)",
+                       s->id, (unsigned)(s->outLen - s->outSent));
+                if (s->tunneled)
+                    gw_log("#%ld tunnel totals: c->u %ld bytes, u->c %ld bytes",
+                           s->id, s->tunC2u, s->tunU2c);
+                s->state = kHPDone;
+            }
         }
+    } else {
+        s->exemptAt = 0;
     }
 
     GWStream_Pump(&s->cli);
@@ -1728,9 +1832,12 @@ static void session_step(GWHttpSession *s)
             step_tunnel_connect(s);
         } else if (s->up.state == kGWStreamError ||
                    s->up.state == kGWStreamClosed) {
+            char why[320];
+
             session_fail(s, "HTTP/1.0 502 Bad Gateway\r\n"
                             "Connection: close\r\n\r\n",
-                         "CONNECT upstream unreachable");
+                         upstream_why(s, "CONNECT upstream unreachable",
+                                      why, sizeof(why)));
         }
         break;
 
