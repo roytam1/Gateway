@@ -53,6 +53,7 @@ int         GW_ActiveSessions(void);
 int         GW_RedirectPolicy(void);
 int         GW_RewriteHttps(void);
 int         GW_ConnectMitm(void);
+int         GW_ConnectUpgrade(void);
 
 /* Ceiling on a relayed response body, in bytes; 0 means no limit. */
 long        GW_MaxBodyBytes(void);

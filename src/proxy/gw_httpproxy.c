@@ -175,6 +175,11 @@ typedef struct {
      * normal path cannot know is that the browser believes it is speaking
      * https, so `mitm` forces TLS on the upstream leg and `mitmHost` supplies
      * the authority for a request whose Host header is missing.
+     *
+     * connect_upgrade reuses the same three fields with a plaintext client
+     * leg: no handshake runs, so there is no kHPMitmWait -- the session goes
+     * straight to kHPRecvRequest and the first inner request rejoins the
+     * normal path, with `mitmPort` at 443 although the CONNECT named 80.
      */
     int           mitm;
     char          mitmHost[GW_MAX_HOST];
@@ -1084,6 +1089,52 @@ static void step_recv_head(GWHttpSession *s)
         return;
     }
 
+    /*
+     * An interim response is not the answer -- forward it and keep waiting.
+     *
+     * A client that sent `Expect: 100-continue` (which the upstream request
+     * carries verbatim, it is not hop-by-hop) waits for this before sending
+     * its body. Treating it as final strands both sides: the client holds
+     * its body for a 100 Gateway already holds, while the origin holds its
+     * final response for a body the client will not send. So the interim
+     * head goes to the client like any bytes, it is consumed, and the
+     * session stays in kHPRecvHead for the final status.
+     *
+     * Everything 1xx except 101 Switching Protocols, which is final by
+     * definition (and unreachable anyway -- the Upgrade header it answers
+     * never leaves here). rwHold is necessarily 0 here -- it only ever
+     * grows in kHPBody, and no path carries it back into kHPRecvHead -- so
+     * a drained flush really is drained and the final filter below cannot
+     * clobber the interim.
+     *
+     * A client that waits indefinitely for its 100 before sending anything
+     * still stalls one step earlier, in kHPSendRequest, which finishes the
+     * body before ever reading a response; that interleaving is a bigger
+     * change for a client that does not exist here -- the ones that send
+     * Expect send their body after a short timeout regardless.
+     */
+    if (res.status >= 100 && res.status < 200 && res.status != 101) {
+        if (s->outLen == 0 &&
+            !session_queue(s, s->uhead, res.head_len)) {
+            session_fail(s, "HTTP/1.0 502 Bad Gateway\r\n"
+                            "Connection: close\r\n\r\n",
+                         "interim response head too large");
+            return;
+        }
+        {
+            int flushed = session_flush(s);
+            if (flushed < 0) { s->state = kHPDone; return; }
+            if (flushed == 0) return;         /* client flow controlled */
+        }
+        gw_log("#%ld <- %d %s (interim, waiting for the final response)",
+               s->id, res.status, s->req.url.host);
+        s->lastActivity = GWNet_Ticks();
+        s->uheadLen -= res.head_len;
+        if (s->uheadLen > 0)
+            memmove(s->uhead, s->uhead + res.head_len, s->uheadLen);
+        return;
+    }
+
     s->status = res.status;
     GW_SetStatus("TLS %s  HTTP %d  %s",
                  s->up.tls ? (GWStream_TlsVersion(&s->up) == 13 ? "1.3" :
@@ -1430,7 +1481,14 @@ static void step_tunnel_connect(GWHttpSession *s)
     static const char kEstablished[] =
         "HTTP/1.0 200 Connection Established\r\n\r\n";
 
-    if (!session_queue(s, kEstablished, sizeof(kEstablished) - 1)) {
+    /*
+     * Queue the 200 exactly once. A partial flush stays in kHPTunnelConnect
+     * and runs this again next tick; re-queueing then would put a second 200
+     * on the wire, which the client reads as the start of its tunneled
+     * response. Anything still queued means the first copy is already there.
+     */
+    if (s->outLen == 0 &&
+        !session_queue(s, kEstablished, sizeof(kEstablished) - 1)) {
         gw_log("#%ld dropping a CONNECT: its 200 would not fit", s->id);
         s->state = kHPDone;
         return;
@@ -1499,6 +1557,45 @@ static void step_tunnel_connect(GWHttpSession *s)
 
         gw_log("#%ld no certificate for %s -- tunnelling instead",
                s->id, s->req.url.host);
+    }
+
+    /*
+     * Upgrade a plaintext CONNECT to https upstream.
+     *
+     * connect_upgrade answers the opposite question from connect_mitm: the
+     * client asked for port 80 and will speak plaintext, so there is no
+     * handshake to terminate -- instead the plaintext request inside the
+     * tunnel is terminated as HTTP and re-originated over TLS to port 443.
+     * No certificate is presented to anyone: the client leg stays plain
+     * HTTP, which is why this is protocol translation rather than MITM.
+     *
+     * Single-shot by design. The response goes back with Connection: close
+     * and the tunnel with it, which is exactly what HTTP/1.0 looks like to
+     * a client that opens one CONNECT per download. Anything already
+     * pipelined past the CONNECT head waits in the socket buffers and is
+     * read fresh below.
+     *
+     * Port 80 only, and opt-in. A CONNECT is allowed to carry anything --
+     * git, ssh, a custom protocol -- and parsing those bytes as HTTP would
+     * break them, so with the pref off everything here stays a raw tunnel
+     * however the client speaks.
+     */
+    if (GW_ConnectUpgrade() && s->req.url.port == 80) {
+        gw_copy_n(s->mitmHost, sizeof(s->mitmHost),
+                  s->req.url.host, strlen(s->req.url.host));
+        s->mitmPort = 443;
+        s->mitm = 1;
+        /* As above: the plain upstream opened for the tunnel is not wanted;
+         * the request inside decides what to fetch, over TLS. */
+        GWStream_Destroy(&s->up);
+        /* The CONNECT head is spent; what follows is a fresh plaintext
+         * request, read as if the client had just connected. */
+        s->cheadLen = 0;
+        s->cheadSent = 0;
+        gw_log("#%ld upgrading %s:80 to https, reading the inner request",
+               s->id, s->mitmHost);
+        s->state = kHPRecvRequest;
+        return;
     }
 
     gw_log("#%ld tunnel open to %s:%u", s->id, s->req.url.host,
@@ -1758,12 +1855,15 @@ static void session_step(GWHttpSession *s)
      *
      * Only these states, deliberately: once a response has started, the write
      * will fail on its own and end the session, and a client that merely
-     * half-closed still gets its answer.
+     * half-closed still gets its answer. A CONNECT whose browser left while
+     * its upstream was still connecting joins the list for the same reason:
+     * there is no response yet and nobody left to read one.
      */
     if ((s->state == kHPConnect || s->state == kHPConnectWait ||
-         s->state == kHPRetryWait || s->state == kHPSendRequest) &&
-        GWStream_PeerGone(&s->cli))
-        s->state = kHPDone;
+         s->state == kHPRetryWait || s->state == kHPSendRequest ||
+         s->state == kHPTunnelConnect) &&
+         GWStream_PeerGone(&s->cli))
+         s->state = kHPDone;
 
     switch (s->state) {
     case kHPRecvRequest:
