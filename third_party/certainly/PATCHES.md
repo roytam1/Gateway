@@ -1008,3 +1008,49 @@ latent: `MacTLS_ServerRead()` and `MacTLS_ServerWrite()` consult the engine
 directly rather than `s->state`, and `GWStream_Pump()` will not move a stream
 back out of Ready, so nothing acted on it. Left in place it would have been
 waiting for the first caller that did.
+
+## §28 — the TLS 1.2 fallback reconnected an adopted connection to port 0
+
+*Certainly patch, in `src/certainly.c` (`MacTLS_FallbackNoRoute()`), with the
+matching log lines in `src/proxy/gw_tunnel.c` and `src/proxy/gw_mail.c`.*
+
+The fallback reconnects: it closes the transport, dials the same host and
+port again, and runs BearSSL's 1.2 engine over the fresh connection. That is
+only possible for a transport Certainly opened itself. An adopted one — a
+tunnel through an HTTP CONNECT or SOCKS proxy, or a STARTTLS upgrade — has no
+route to redial: `ct_transport_adopt()` stores no host or port, so the port
+read 0, and even with them a fresh dial would bypass the proxy or the
+cleartext prologue the server is waiting on.
+
+What this used to do was dial that port 0 directly. The proxy tunnel was torn
+down first, so the far end logged "peer suddenly disconnected" while Gateway
+reported an empty-handed handshake failure — no BearSSL code, no transport
+error, no resolved address — which reads as a proxy problem although the
+proxy had already done its part. The actual event is a version problem: the
+server chose TLS 1.2.
+
+An adopted transport now fails with the original connection intact and raises
+`MacTLS_FallbackNoRoute()`, and the tunnel and mail modules log the remedy
+beside the failure: the far end needs TLS 1.3 enabled. Falling back across a
+proxy or STARTTLS would mean re-running the proxy handshake or the prologue
+from inside the library, which does not know either, so that stays
+unimplemented rather than silently wrong.
+
+## §29 — adopted connections can start in TLS 1.2 for far ends without 1.3
+
+*Certainly patch, in `src/certainly.c` (`MacTLS_CreateOnEndpointTLS12()`),
+with `GWStream_UpgradeToTLS12()` and the `tunnel_tls12` pref on top.*
+
+§28 named the remedy as "enable TLS 1.3 on the far end", and the first far
+end to hit it cannot: an old stunnel built against a pre-1.3 OpenSSL. For an
+adopted connection the 1.3 ClientHello buys nothing there — only the fallback
+that cannot run — so the library now offers to skip it:
+`MacTLS_CreateOnEndpointTLS12()` adopts the socket like `CreateOnEndpoint`,
+resets BearSSL's 1.2 engine onto it (hostname for SNI, as the fallback does),
+and sets `force_tls12`, which keeps both 1.3 branches of `MacTLS_Pump()` from
+ever starting. Everything below — record I/O, version reporting, close — is
+the same engine path the fallback already uses, so `GetVersion()` reports 12
+on success with no further special cases.
+
+The tunnel selects it with `tunnel_tls12 = 1` in
+`begin_tls_or_splice()`; the default path is untouched.

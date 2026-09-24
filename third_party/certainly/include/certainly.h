@@ -123,6 +123,13 @@ MacTLS_Context *MacTLS_CreateWithConfig(const char *host, uint16_t port,
  * the NULL case.
  */
 MacTLS_Context *MacTLS_CreateOnEndpoint(const char *host, CTSocket sock);
+ /*
+  * Adopted, but for a far end with no TLS 1.3: BearSSL's TLS 1.2 engine
+  * drives from the first pump and no 1.3 ClientHello is ever sent, so no
+  * fallback reconnect is needed. Same ownership and return contract as
+  * MacTLS_CreateOnEndpoint.
+  */
+MacTLS_Context *MacTLS_CreateOnEndpointTLS12(const char *host, CTSocket sock);
 MacTLS_State    MacTLS_Pump(MacTLS_Context *ctx);
 void            MacTLS_Close(MacTLS_Context *ctx);
 
@@ -164,6 +171,14 @@ int          MacTLS_GetBearSSLError(const MacTLS_Context *ctx);
  * of the two failed, using the same BR_ERR_* numbering for both, so this is
  * how a caller tells them apart -- and the two want opposite fixes. */
 int          MacTLS_GetTls13Error(const MacTLS_Context *ctx);
+ /*
+  * 1 when the server chose TLS 1.2 but the connection is adopted (STARTTLS,
+  * or a tunnel through a forward proxy), so the library could not reconnect
+  * to fall back: the adopted transport carries no route, and a fresh dial
+  * would bypass the proxy or the cleartext prologue. The remedy is on the
+  * far end -- enable TLS 1.3 there -- which is what the caller should log.
+  */
+int          MacTLS_FallbackNoRoute(const MacTLS_Context *ctx);
 
 /* Returns the negotiated protocol version, or kMacTLS_VersionUnknown
  * before the handshake completes (state != kMacTLS_Connected). */

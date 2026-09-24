@@ -89,6 +89,42 @@ int GWStream_UpgradeToTLS(GWStream *s, const char *host)
 }
 
 /*
+ * The same detach, but for a far end with no TLS 1.3: BearSSL's 1.2 engine
+ * drives from the first pump and no fallback reconnect is needed, which is
+ * what makes 1.2-only servers reachable through a proxy tunnel or STARTTLS.
+ */
+int GWStream_UpgradeToTLS12(GWStream *s, const char *host)
+{
+    CTSocket sock;
+
+    if (s == NULL || s->tls || s->plain == NULL) return 0;
+    if (GWConn_GetState(s->plain) != kGWConnReady ||
+        GWConn_PeerClosed(s->plain)) return 0;
+
+    sock = GWConn_DetachSocket(s->plain);
+    GWConn_Destroy(s->plain);
+    s->plain = NULL;
+
+    if (sock == CT_SOCKET_NONE) {
+        s->state = kGWStreamError;
+        return 0;
+    }
+
+    /* Certainly owns the connection from here, including on failure. */
+    s->sec = MacTLS_CreateOnEndpointTLS12(host, sock);
+    if (s->sec == NULL || MacTLS_GetState(s->sec) == kMacTLS_Error) {
+        s->state = kGWStreamError;
+        return 0;
+    }
+
+    s->tls = true;
+    s->eof = false;
+    s->startTicks = GWNet_Ticks();
+    s->state = kGWStreamConnecting;
+    return 1;
+}
+
+/*
  * The same detach, with Gateway answering the handshake instead of starting
  * it. The browser has just been told "200 Connection Established" and is about
  * to send a ClientHello; from here the socket belongs to Certainly's server
@@ -289,6 +325,18 @@ int GWStream_TlsVersion(const GWStream *s)
     case kMacTLS_Version13: return 13;
     default:                return 0;
     }
+}
+
+/*
+ * 1 when the far end chose TLS 1.2 on an adopted connection (a proxy-CONNECT
+ * tunnel or STARTTLS), where Certainly cannot reconnect to fall back. The
+ * caller logs the remedy -- TLS 1.3 on the far end -- because the transport
+ * diagnostics alone say nothing: no BearSSL code, no OT error, no address.
+ */
+int GWStream_FallbackNoRoute(const GWStream *s)
+{
+    if (s == NULL || !s->tls || s->sec == NULL) return 0;
+    return MacTLS_FallbackNoRoute(s->sec);
 }
 
 unsigned int GWStream_ClientHelloVersion(const GWStream *s)

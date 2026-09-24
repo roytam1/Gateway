@@ -300,8 +300,19 @@ static void begin_tls_or_splice(GWTunnelSession *s)
     /*
      * host authenticates what the far end presents (SNI and certificate),
      * exactly as a direct Certainly dial would: the proxy only moved bytes.
+     *
+     * tunnel_tls12 forces the 1.2 engine from the first handshake bytes,
+     * for far ends with no TLS 1.3 (an old stunnel): the 1.3 ClientHello
+     * would only buy a fallback that an adopted connection cannot perform
+     * (§28). The success line in kTNLSpliceWait still names the version
+     * that actually negotiated.
      */
-    if (!GWStream_UpgradeToTLS(&s->up, s->remoteHost)) {
+    if (GWConfig_Num("tunnel_tls12", 0) != 0) {
+        if (!GWStream_UpgradeToTLS12(&s->up, s->remoteHost)) {
+            tunnel_fail(s, "cannot start TLS 1.2 on the far leg");
+            return;
+        }
+    } else if (!GWStream_UpgradeToTLS(&s->up, s->remoteHost)) {
         tunnel_fail(s, "cannot start TLS on the far leg");
         return;
     }
@@ -557,6 +568,18 @@ static void session_step(GWTunnelSession *s)
             char why[160];
             gw_log("tunnel #%ld %s", s->id,
                    GWStream_Describe(&s->up, why, sizeof(why)));
+            /*
+             * The far end speaks only TLS 1.2, and falling back needs a
+             * fresh connection the tunnel cannot re-open past the proxy
+             * (or the STARTTLS prologue). Say so with the remedy: the
+             * diagnostics above carry no code, no address and no version,
+             * and "handshake failed" alone sends the reader to the proxy,
+             * which already did its part. Enable TLS 1.3 on the far end.
+             */
+            if (GWStream_FallbackNoRoute(&s->up))
+                gw_log("tunnel #%ld %s:%u chose TLS 1.2 -- enable TLS 1.3 "
+                       "on the far end", s->id,
+                       s->remoteHost, (unsigned)s->remotePort);
             tunnel_fail(s, "TLS handshake with the far leg failed");
         }
         break;

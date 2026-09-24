@@ -163,6 +163,10 @@ void          GWStream_Adopt(GWStream *s, GWConn *c);
  * in a state that can be upgraded.
  */
 int           GWStream_UpgradeToTLS(GWStream *s, const char *host);
+/* Adopted, but for a far end with no TLS 1.3: the 1.2 engine drives from the
+ * first pump, so no fallback reconnect is needed. Returns 0 if the stream
+ * is not in a state that can be upgraded. */
+int           GWStream_UpgradeToTLS12(GWStream *s, const char *host);
 
 /*
  * The same upgrade with the roles reversed: Gateway answers the handshake
@@ -199,6 +203,10 @@ int           GWStream_PeerGone(const GWStream *s);
 
 /* 0 when unknown or plain, otherwise 12 or 13. */
 int           GWStream_TlsVersion(const GWStream *s);
+/* 1 when the far end chose TLS 1.2 on an adopted connection (proxy-CONNECT
+ * tunnel or STARTTLS), where no fallback reconnect is possible. The remedy
+ * is TLS 1.3 on the far end. */
+int           GWStream_FallbackNoRoute(const GWStream *s);
 /* The highest protocol version the browser offered in its ClientHello
  * (0x0300 = SSL 3.0, 0x0301 = TLS 1.0, and so on). 0 when unknown, plain, or
  * before the hello arrived. Server side only, so connect_mitm. */

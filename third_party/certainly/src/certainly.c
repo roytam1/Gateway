@@ -299,6 +299,67 @@ MacTLS_Context *MacTLS_CreateOnEndpoint(const char *host, CTSocket sock)
     return ctx;
 }
 
+/*
+ * Adopted, but for a far end with no TLS 1.3: BearSSL's 1.2 engine drives
+ * from the first pump, and the 1.3 ClientHello is never sent -- so there is
+ * no ServerHello to fall back from and no reconnect to perform. The engine
+ * is reset here (hostname for SNI), exactly as the fallback path does after
+ * re-arming it; setup_bearssl() deliberately leaves that to its callers.
+ */
+MacTLS_Context *MacTLS_CreateOnEndpointTLS12(const char *host, CTSocket sock)
+{
+    MacTLS_Context *ctx;
+
+    if (sock == CT_SOCKET_NONE) return NULL;
+
+    ctx = (MacTLS_Context *)NewPtrClear(sizeof(MacTLS_Context));
+    if (ctx == NULL) {
+        /* Ownership transferred unconditionally, so it is ours to close. */
+        ct_socket_close(sock);
+        return NULL;
+    }
+
+    ctx->state  = kMacTLS_Connecting;
+    ctx->config = NULL;
+
+    if (strlen(host) > 253 || strlen(host) >= sizeof(ctx->host)) {
+        ctx->state = kMacTLS_Error;
+        ctx->error = kMacTLS_ErrDNS;
+        ct_socket_close(sock);
+        return ctx;
+    }
+
+    strncpy(ctx->host, host, sizeof(ctx->host) - 1);
+    ctx->host[sizeof(ctx->host) - 1] = '\0';
+
+    ctx->transport = ct_transport_adopt(sock);
+    if (ctx->transport == NULL) {
+        ctx->state = kMacTLS_Error;
+        ctx->error = kMacTLS_ErrMemory;
+        ct_socket_close(sock);
+        return ctx;
+    }
+
+    setup_bearssl(ctx);
+
+    /*
+     * Nothing to re-arm: the engine has never run, so set_buffer() in
+     * setup_bearssl() is its first arming. The reset only fails on a name
+     * too long for the engine or an RNG that will not seed.
+     */
+    if (!br_ssl_client_reset(&ctx->sc, ctx->host, 0)) {
+        ctx->state = kMacTLS_Error;
+        ctx->error = kMacTLS_ErrHandshake;
+        return ctx;
+    }
+
+    ctx->force_tls12 = true;
+    ctx->tls13_active = false;
+    ctx->tls13_started = false;
+
+    return ctx;
+}
+
 /* ── TLS 1.3 Pump Helpers ── */
 
 /*
@@ -435,6 +496,25 @@ static MacTLS_State tls13_pump_handshake(MacTLS_Context *ctx)
          */
         {
             uint16_t port = ct_transport_port(ctx->transport);
+
+            /*
+             * An adopted transport (STARTTLS, or a tunnel through an HTTP
+             * CONNECT / SOCKS proxy) has no route to reconnect through:
+             * adopt stores no host or port, so port reads 0 here -- and
+             * even with them, a fresh dial would bypass the proxy or the
+             * cleartext prologue the server is waiting on. Tearing the
+             * proxied socket down and dialling port 0 direct is what this
+             * used to do, which the far end sees as "peer suddenly
+             * disconnected" and the log reports as an empty-handed
+             * handshake failure. Fail with the original connection intact
+             * and let the caller name the remedy (§28).
+             */
+            if (port == 0) {
+                ctx->fell_back_no_route = true;
+                ctx->state = kMacTLS_Error;
+                ctx->error = kMacTLS_ErrHandshake;
+                return ctx->state;
+            }
 
             /* Close and destroy the current transport */
             ct_transport_close(ctx->transport);
@@ -868,9 +948,11 @@ MacTLS_State MacTLS_Pump(MacTLS_Context *ctx)
      *
      * If we haven't fallen back to TLS 1.2, drive the TLS 1.3
      * handshake state machine. This bypasses BearSSL's T0 engine
-     * entirely during the handshake phase.
+     * entirely during the handshake phase. force_tls12 skips both
+     * branches below, so the BearSSL path drives from the first pump.
      */
-    if (!ctx->tls13_started && ctx->hs13.is_tls13 == false &&
+    if (!ctx->force_tls12 &&
+        !ctx->tls13_started && ctx->hs13.is_tls13 == false &&
         ctx->hs13.state == kTLS13_SendClientHello) {
         /*
          * First time through after TCP connect — start the TLS 1.3
@@ -883,7 +965,8 @@ MacTLS_State MacTLS_Pump(MacTLS_Context *ctx)
         return tls13_pump_handshake(ctx);
     }
 
-    if (ctx->tls13_started && ctx->state != kMacTLS_Connected) {
+    if (!ctx->force_tls12 &&
+        ctx->tls13_started && ctx->state != kMacTLS_Connected) {
         /*
          * TLS 1.3 handshake in progress.
          * Keep pumping the TLS 1.3 state machine until it completes,
@@ -1365,6 +1448,12 @@ int MacTLS_GetTls13Error(const MacTLS_Context *ctx)
 {
     if (ctx == NULL) return 0;
     return ctx->hs13.error;
+}
+
+int MacTLS_FallbackNoRoute(const MacTLS_Context *ctx)
+{
+    if (ctx == NULL) return 0;
+    return ctx->fell_back_no_route ? 1 : 0;
 }
 
 int MacTLS_GetBearSSLError(const MacTLS_Context *ctx)

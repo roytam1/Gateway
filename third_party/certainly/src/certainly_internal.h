@@ -128,6 +128,24 @@ struct MacTLS_Context {
     bool            tls13_active;
     /* True once TLS 1.3 handshake has started (ClientHello sent) */
     bool            tls13_started;
+
+    /*
+     * The server chose TLS 1.2 but the transport is adopted (STARTTLS, or a
+     * proxy-CONNECT tunnel), so there is no route to reconnect through --
+     * adopted transports carry no host/port, and even with them a fresh
+     * dial would bypass the proxy or the cleartext prologue. Set instead
+     * of destroying the transport, so the caller can say what is actually
+     * wrong rather than reporting a bogus direct reconnect. See §28.
+     */
+    bool            fell_back_no_route;
+
+    /*
+     * Skip the TLS 1.3 state machine and drive BearSSL's 1.2 engine from
+     * the first pump (MacTLS_CreateOnEndpointTLS12). For far ends with no
+     * TLS 1.3, where the 1.3 ClientHello would only buy a fallback that an
+     * adopted connection cannot perform. See §29.
+     */
+    bool            force_tls12;
 };
 
 struct MacTLS_Config {

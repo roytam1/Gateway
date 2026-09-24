@@ -906,6 +906,14 @@ static void session_step(GWMailSession *s)
                 char why[160];
                 mail_fail(s, "421 4.4.1 TLS handshake with the mail server failed\r\n",
                           GWStream_Describe(&s->up, why, sizeof(why)));
+                /*
+                 * Same adopted-connection limit as the generic tunnel
+                 * (§28): STARTTLS cannot reconnect to fall back, so a
+                 * 1.2-only mail host needs TLS 1.3 enabled server-side.
+                 */
+                if (GWStream_FallbackNoRoute(&s->up))
+                    gw_log("mail #%ld %s chose TLS 1.2 -- enable TLS 1.3 "
+                           "on the mail server", s->id, s->upHost);
             }
         }
         break;
