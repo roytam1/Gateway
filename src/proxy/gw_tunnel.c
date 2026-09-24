@@ -316,6 +316,17 @@ static void begin_tls_or_splice(GWTunnelSession *s)
         tunnel_fail(s, "cannot start TLS on the far leg");
         return;
     }
+    /*
+     * Testing only: skip certificate validation on the far leg. Loud on
+     * purpose -- with this on, anyone between Gateway and the far end can
+     * read the tunnel, and nothing will say so again. Tunnel only; mail
+     * never takes this path whatever the prefs say.
+     */
+    if (GWConfig_Num("tunnel_insecure", 0) != 0) {
+        GWStream_SetInsecure(&s->up);
+        gw_log("tunnel #%ld WARNING: TLS certificate validation DISABLED "
+               "(tunnel_insecure)", s->id);
+    }
     s->lastActivity = GWNet_Ticks();
     s->state = kTNLSpliceWait;
 }

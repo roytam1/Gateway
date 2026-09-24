@@ -130,6 +130,16 @@ MacTLS_Context *MacTLS_CreateOnEndpoint(const char *host, CTSocket sock);
   * MacTLS_CreateOnEndpoint.
   */
 MacTLS_Context *MacTLS_CreateOnEndpointTLS12(const char *host, CTSocket sock);
+ /*
+  * Testing only: accept any certificate from the far end -- wrong name,
+  * private CA, expired, all of it. The end-entity public key is still
+  * decoded so the handshake can complete, but nothing is verified, so a
+  * middlebox or impostor is indistinguishable from the real server. Must
+  * be called before the first Pump. Gateway exposes this as
+  * `tunnel_insecure` for the generic tunnel alone; it is never used for
+  * mail, the web proxy, or the archive.
+  */
+void         MacTLS_SetInsecure(MacTLS_Context *ctx);
 MacTLS_State    MacTLS_Pump(MacTLS_Context *ctx);
 void            MacTLS_Close(MacTLS_Context *ctx);
 

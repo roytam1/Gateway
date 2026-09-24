@@ -1054,3 +1054,29 @@ on success with no further special cases.
 
 The tunnel selects it with `tunnel_tls12 = 1` in
 `begin_tls_or_splice()`; the default path is untouched.
+
+## §30 — a trust-any validator for testing against unvalidatable far ends
+
+*Certainly patch, in `src/certainly.c` (`MacTLS_SetInsecure()`), exposed as
+`GWStream_SetInsecure()` and the `tunnel_insecure` pref.*
+
+The first far end past the new tunnel failed validation rather than the
+handshake: a publicly trusted chain for another name (`TLS 56`), on a host
+whose certificate cannot be fixed from here. The library had no way to say
+"encrypt without authenticating" — `MacTLS_ConfigAddCA` is still a stub, so
+not even a private CA can be installed — which left testing fully blocked
+behind a correct rejection.
+
+`MacTLS_SetInsecure()` swaps both validation paths (BearSSL's 1.2 engine and
+the 1.3 state machine's shared `x509_ctx`) onto a trust-any engine that
+decodes only the end-entity certificate, for its public key, and accepts
+everything else without checking. It is modelled on BearSSL's own knownkey
+engine, except the key comes out of the peer's certificate through the
+decoder instead of being configured in advance; an undecodable certificate
+fails the chain with the decoder's own error, so the engine reports a
+handshake failure rather than dereferencing a NULL key. Both key usages are
+reported permitted, as in BearSSL's test tool.
+
+Deliberately narrow: the setter must run before the first Pump, the tunnel
+logs a WARNING naming the pref every time it takes effect, and the mail
+module has no path to it whatever the prefs say.

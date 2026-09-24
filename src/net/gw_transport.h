@@ -207,6 +207,9 @@ int           GWStream_TlsVersion(const GWStream *s);
  * tunnel or STARTTLS), where no fallback reconnect is possible. The remedy
  * is TLS 1.3 on the far end. */
 int           GWStream_FallbackNoRoute(const GWStream *s);
+/* Testing only (tunnel_insecure): accept any certificate on a client stream.
+ * Never use on mail or proxy streams. Must run before the first Pump. */
+void          GWStream_SetInsecure(GWStream *s);
 /* The highest protocol version the browser offered in its ClientHello
  * (0x0300 = SSL 3.0, 0x0301 = TLS 1.0, and so on). 0 when unknown, plain, or
  * before the hello arrived. Server side only, so connect_mitm. */

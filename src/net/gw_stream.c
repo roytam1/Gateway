@@ -339,6 +339,18 @@ int GWStream_FallbackNoRoute(const GWStream *s)
     return MacTLS_FallbackNoRoute(s->sec);
 }
 
+/*
+ * Testing only (tunnel_insecure): stop validating the far end's
+ * certificate. Client side only -- the MITM server side presents
+ * certificates rather than checking them. Must run before the handshake,
+ * i.e. right after an Upgrade call returns and before the first Pump.
+ */
+void GWStream_SetInsecure(GWStream *s)
+{
+    if (s == NULL || !s->tls || s->sec == NULL) return;
+    MacTLS_SetInsecure(s->sec);
+}
+
 unsigned int GWStream_ClientHelloVersion(const GWStream *s)
 {
     if (s == NULL || !s->tls || s->srv == NULL) return 0;

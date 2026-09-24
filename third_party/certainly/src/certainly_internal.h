@@ -31,6 +31,16 @@
  */
 #define CERTAINLY_IOBUF_SIZE  (16384 + 325)  /* max TLS record + overhead */
 
+/*
+ * Trust-any X.509 validator context (testing only, §30). The vtable must
+ * stay the first field: the engine is handed &vtable and casts it back.
+ */
+typedef struct {
+    const br_x509_class *vtable;
+    br_x509_decoder_context dc;
+    int cert_index;
+} MacTLS_InsecureCtx;
+
 struct MacTLS_Context {
     /* Connection state */
     MacTLS_State    state;
@@ -146,6 +156,14 @@ struct MacTLS_Context {
      * adopted connection cannot perform. See §29.
      */
     bool            force_tls12;
+
+    /*
+     * Trust-any validator for testing (MacTLS_SetInsecure). Only the
+     * end-entity certificate is decoded, for its public key; everything
+     * else about the chain is accepted without checking. Off unless
+     * enabled, and never used by the mail module. See §30.
+     */
+    MacTLS_InsecureCtx insecure;
 };
 
 struct MacTLS_Config {

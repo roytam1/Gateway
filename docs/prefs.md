@@ -204,6 +204,7 @@ exactly as if the tunnel were not there.
 | `tunnel_remote_port` | `443` | The far port. |
 | `tunnel_tls` | `1` | Wrap the far leg in TLS. `0` relays plaintext — only for a far leg that is already safe. |
 | `tunnel_tls12` | `0` | Speak only TLS 1.2 on the far leg, for far ends with no TLS 1.3 (an old stunnel). The default negotiates 1.3 first, but falling back from it needs a fresh connection the tunnel cannot re-open past the proxy — so a 1.2-only far end fails unless this is set. When set, the log reports `TLS 1.2` on success like any other 1.2 negotiation. |
+| `tunnel_insecure` | `0` | Testing only: accept any certificate on the far leg — wrong name, private CA, expired — without checking. The tunnel then proves only that bytes flow, not who they flow to, so turn it back off afterwards. Never applies to mail. |
 | `tunnel_proxy` | `none` | `none`, `http` (CONNECT, with `Proxy-Authorization` when a user is set) or `socks5` (no-auth only). Anything else drops the client and logs the valid values. |
 | `tunnel_proxy_host` | — | The proxy. Required unless `tunnel_proxy` is `none`. |
 | `tunnel_proxy_port` | `8080` / `1080` | The proxy port: `8080` for `http`, `1080` for `socks5`. Set explicitly to override. |

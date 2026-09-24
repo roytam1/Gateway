@@ -360,6 +360,108 @@ MacTLS_Context *MacTLS_CreateOnEndpointTLS12(const char *host, CTSocket sock)
     return ctx;
 }
 
+/* ── Trust-any validator (testing only) ── */
+
+/*
+ * Accept any chain and return the end-entity public key, decoded from the
+ * first certificate. Signatures, names, dates and trust anchors are all
+ * ignored by design -- this exists to test against a far end whose
+ * certificate cannot validate (wrong name, private CA), and must never be
+ * enabled for anything carrying credentials. Modelled on BearSSL's own
+ * knownkey engine (x509_knownkey.c), except the key comes out of the peer's
+ * certificate via the decoder instead of being configured in advance.
+ *
+ * Only the first certificate is fed to the decoder; the rest of the chain
+ * is skipped. An undecodable end-entity certificate fails the chain with
+ * the decoder's own error, so the engine reports a handshake failure
+ * rather than dereferencing a NULL key.
+ */
+typedef struct {
+    const br_x509_class *vtable;
+    br_x509_decoder_context dc;
+    int cert_index;
+} InsecureCtx;   /* layout must match MacTLS_InsecureCtx in the header */
+
+static void insecure_start_chain(const br_x509_class **ctx,
+                                 const char *server_name)
+{
+    InsecureCtx *cc = (InsecureCtx *)(void *)ctx;
+
+    (void)server_name;
+    cc->cert_index = 0;
+}
+
+static void insecure_start_cert(const br_x509_class **ctx, uint32_t length)
+{
+    InsecureCtx *cc = (InsecureCtx *)(void *)ctx;
+
+    (void)length;
+    if (cc->cert_index == 0)
+        br_x509_decoder_init(&cc->dc, 0, 0);
+}
+
+static void insecure_append(const br_x509_class **ctx,
+                            const unsigned char *buf, size_t len)
+{
+    InsecureCtx *cc = (InsecureCtx *)(void *)ctx;
+
+    if (cc->cert_index == 0)
+        br_x509_decoder_push(&cc->dc, buf, len);
+}
+
+static void insecure_end_cert(const br_x509_class **ctx)
+{
+    InsecureCtx *cc = (InsecureCtx *)(void *)ctx;
+
+    cc->cert_index++;
+}
+
+static unsigned insecure_end_chain(const br_x509_class **ctx)
+{
+    InsecureCtx *cc = (InsecureCtx *)(void *)ctx;
+
+    if (cc->cert_index == 0)
+        return BR_ERR_X509_EMPTY_CHAIN;
+    return (unsigned)br_x509_decoder_last_error(&cc->dc);
+}
+
+static const br_x509_pkey *insecure_get_pkey(
+    const br_x509_class *const *ctx, unsigned *usages)
+{
+    InsecureCtx *cc = (InsecureCtx *)(void *)ctx;
+
+    /* Both uses permitted, as in BearSSL's own test tool (twrch.c). */
+    if (usages != NULL)
+        *usages = BR_KEYTYPE_KEYX | BR_KEYTYPE_SIGN;
+    return br_x509_decoder_get_pkey(&cc->dc);
+}
+
+static const br_x509_class insecure_vtable = {
+    sizeof(InsecureCtx),
+    insecure_start_chain,
+    insecure_start_cert,
+    insecure_append,
+    insecure_end_cert,
+    insecure_end_chain,
+    insecure_get_pkey
+};
+
+/*
+ * Testing only: stop validating the far end's certificate. Swaps both
+ * validation paths -- BearSSL's 1.2 engine and the 1.3 state machine, which
+ * shares its validator through hs13.x509_ctx -- onto the trust-any engine
+ * above. Must be called before the first Pump; the handshake has not run
+ * yet at that point, so neither engine has touched a validator.
+ */
+void MacTLS_SetInsecure(MacTLS_Context *ctx)
+{
+    if (ctx == NULL) return;
+
+    ctx->insecure.vtable = &insecure_vtable;
+    br_ssl_engine_set_x509(&ctx->sc.eng, &ctx->insecure.vtable);
+    ctx->hs13.x509_ctx = &ctx->insecure.vtable;
+}
+
 /* ── TLS 1.3 Pump Helpers ── */
 
 /*
