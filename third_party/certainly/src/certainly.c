@@ -462,6 +462,53 @@ void MacTLS_SetInsecure(MacTLS_Context *ctx)
     ctx->hs13.x509_ctx = &ctx->insecure.vtable;
 }
 
+/* ── SNI override (testing/diagnosis) ── */
+
+/* The name the handshake offers, or NULL for none. */
+static const char *eff_sni(const MacTLS_Context *ctx)
+{
+    if (ctx->sni_mode == 2) return NULL;
+    if (ctx->sni_mode == 1) return ctx->sni_override;
+    return ctx->host;
+}
+
+/*
+ * Replace the server name the handshake sends (SNI) and validates
+ * against. sni == NULL omits SNI entirely; otherwise that name is sent
+ * (BearSSL accepts NULL for "no SNI"). Must run before the first Pump:
+ * both engines are idle then, so re-resetting BearSSL here is the same
+ * call the force-1.2 entry and the fallback make themselves. The 1.3
+ * state machine picks the name up through eff_sni() in MacTLS_Pump().
+ */
+void MacTLS_SetSNI(MacTLS_Context *ctx, const char *sni)
+{
+    if (ctx == NULL) return;
+
+    if (sni == NULL) {
+        ctx->sni_mode = 2;
+    } else {
+        if (strlen(sni) >= sizeof(ctx->sni_override))
+            return;             /* overlong: keep the previous name */
+        strcpy(ctx->sni_override, sni);
+        ctx->sni_mode = 1;
+    }
+    if (ctx->state != kMacTLS_Connecting)
+        return;             /* handshake running or failed: the name is fixed */
+    /*
+     * BearSSL reads its name only at reset. A fresh engine takes a reset
+     * as ordinary initialisation; on the fallback path below the same
+     * call re-arms it, so this stays consistent however the handshake
+     * proceeds. A reset that fails here fails the context the same way
+     * the other call sites do.
+     */
+    br_ssl_engine_set_buffer(&ctx->sc.eng, ctx->iobuf,
+                             sizeof(ctx->iobuf), 0);
+    if (!br_ssl_client_reset(&ctx->sc, eff_sni(ctx), 0)) {
+        ctx->state = kMacTLS_Error;
+        ctx->error = kMacTLS_ErrHandshake;
+    }
+}
+
 /* ── TLS 1.3 Pump Helpers ── */
 
 /*
@@ -559,7 +606,7 @@ static MacTLS_State tls13_pump_handshake(MacTLS_Context *ctx)
     r = tls13_handshake_step(&ctx->hs13,
                              ctx->tls13_recv_buf,
                              &ctx->tls13_recv_len,
-                             ctx->host);
+                             eff_sni(ctx));
 
     switch (r) {
     case kTLS13_OK:
@@ -648,7 +695,7 @@ static MacTLS_State tls13_pump_handshake(MacTLS_Context *ctx)
                                      sizeof(ctx->iobuf), 0);
 
             /* Re-init BearSSL for TLS 1.2 (the T0 engine will drive) */
-            if (!br_ssl_client_reset(&ctx->sc, ctx->host, 0)) {
+            if (!br_ssl_client_reset(&ctx->sc, eff_sni(ctx), 0)) {
                 /*
                  * Nothing is retryable past this point: the reset only
                  * fails on a name too long for the engine or an RNG that

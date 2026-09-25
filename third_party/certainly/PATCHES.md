@@ -1080,3 +1080,26 @@ reported permitted, as in BearSSL's test tool.
 Deliberately narrow: the setter must run before the first Pump, the tunnel
 logs a WARNING naming the pref every time it takes effect, and the mail
 module has no path to it whatever the prefs say.
+
+## §31 — the SNI name is overridable for SNI-policing middleboxes
+
+*Certainly patch (`MacTLS_SetSNI()`), exposed as `GWStream_SetSNI()` and the
+`tunnel_sni` pref.*
+
+Through one corporate proxy (BlueCoat-style, `Via: 1.1 wcg`), a handshake
+carrying no SNI completed while an otherwise identical one carrying the far
+hostname stalled past the 30-second timeout: the CONNECT was accepted in
+both cases, and socat's nameless 1.2 ClientHello flowed where Gateway's
+SNI-bearing one did not. Nothing in the failure says so -- it reads as the
+same empty-handed handshake failure as §28.
+
+`MacTLS_SetSNI()` replaces the name BearSSL sends and validates against
+(NULL omits SNI; BearSSL accepts that) and the name the 1.3 state machine
+offers, through one `eff_sni()` helper used by the creation reset, the
+fallback reset, and the 1.3 pump. It must run before the first Pump, like
+`SetInsecure`, and re-resets the idle engine the same way the other call
+sites do. The 1.3 ClientHello builder treats a NULL name as "omit the SNI
+extension" rather than dereferencing it -- the one `strlen(hostname)` in
+that file assumed a name always exists, which an omitted SNI disproves on
+the first handshake. The tunnel logs which SNI it sends; the default (pref
+unset) is unchanged.

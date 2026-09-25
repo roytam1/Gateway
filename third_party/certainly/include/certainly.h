@@ -140,6 +140,15 @@ MacTLS_Context *MacTLS_CreateOnEndpointTLS12(const char *host, CTSocket sock);
   * mail, the web proxy, or the archive.
   */
 void         MacTLS_SetInsecure(MacTLS_Context *ctx);
+ /*
+  * Replace the server name the handshake sends (SNI) and, when validating,
+  * checks against. sni == NULL omits SNI entirely. Must run before the
+  * first Pump. Exists because a middlebox on a CONNECT tunnel may apply
+  * SNI policy to the handshake inside: one far end answered a nameless
+  * ClientHello and stalled one carrying the hostname, with no other
+  * difference on the wire.
+  */
+void         MacTLS_SetSNI(MacTLS_Context *ctx, const char *sni);
 MacTLS_State    MacTLS_Pump(MacTLS_Context *ctx);
 void            MacTLS_Close(MacTLS_Context *ctx);
 

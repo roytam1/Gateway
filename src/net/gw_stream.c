@@ -351,6 +351,17 @@ void GWStream_SetInsecure(GWStream *s)
     MacTLS_SetInsecure(s->sec);
 }
 
+/*
+ * Testing/diagnosis (tunnel_sni): replace the SNI name the handshake
+ * sends, or omit SNI when sni is NULL. Client side only, before the first
+ * Pump -- i.e. right after an Upgrade call returns.
+ */
+void GWStream_SetSNI(GWStream *s, const char *sni)
+{
+    if (s == NULL || !s->tls || s->sec == NULL) return;
+    MacTLS_SetSNI(s->sec, sni);
+}
+
 unsigned int GWStream_ClientHelloVersion(const GWStream *s)
 {
     if (s == NULL || !s->tls || s->srv == NULL) return 0;

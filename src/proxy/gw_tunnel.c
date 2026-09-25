@@ -327,6 +327,27 @@ static void begin_tls_or_splice(GWTunnelSession *s)
         gw_log("tunnel #%ld WARNING: TLS certificate validation DISABLED "
                "(tunnel_insecure)", s->id);
     }
+    /*
+     * Diagnosis for SNI-policing middleboxes: socat's handshake carries no
+     * SNI where Gateway's carries the far hostname, and one corporate
+     * proxy answered only the former. Empty (the default) keeps the far
+     * hostname; "none" omits SNI; anything else is sent instead.
+     */
+    {
+        const char *want = GWConfig_Str("tunnel_sni", "");
+        char sni[GW_NET_HOST_MAX];
+
+        if (want[0] != '\0') {
+            gw_copy_n(sni, sizeof(sni), want, strlen(want));
+            if (gw_stricmp(sni, "none") == 0 || strcmp(sni, "-") == 0) {
+                GWStream_SetSNI(&s->up, NULL);
+                gw_log("tunnel #%ld SNI omitted (tunnel_sni)", s->id);
+            } else {
+                GWStream_SetSNI(&s->up, sni);
+                gw_log("tunnel #%ld SNI %s (tunnel_sni)", s->id, sni);
+            }
+        }
+    }
     s->lastActivity = GWNet_Ticks();
     s->state = kTNLSpliceWait;
 }

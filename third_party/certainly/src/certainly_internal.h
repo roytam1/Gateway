@@ -158,6 +158,16 @@ struct MacTLS_Context {
     bool            force_tls12;
 
     /*
+     * SNI override (MacTLS_SetSNI, §31). 0 sends the dial hostname (the
+     * default), 1 sends sni_override, 2 sends no SNI at all. A middlebox
+     * doing SNI policy on a CONNECT tunnel is the reason to touch this:
+     * socat's handshake carries no SNI where Gateway's carries the far
+     * hostname, and only one of them gets answered.
+     */
+    int             sni_mode;
+    char            sni_override[256];
+
+    /*
      * Trust-any validator for testing (MacTLS_SetInsecure). Only the
      * end-entity certificate is decoded, for its public key; everything
      * else about the chain is accepted without checking. Off unless
