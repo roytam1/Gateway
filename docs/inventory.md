@@ -311,11 +311,15 @@ the Resource Manager returns the **existing** refNum and the matching
 * **Content codings.** Gateway sends `Accept-Encoding: identity` upstream. An
   origin that ignores that and gzips anyway will have its bytes passed through
   undecoded.
-* **The `CONNECT` tunnel is unverified.** Module 1 shape 3 is implemented and
-  reachable, but there is no git client for Mac OS 9 to point at it, so
-  nothing has ever opened a tunnel through it in anger. Phase 3's "raw
-  CONNECT verification for git" stays open for that reason rather than for
-  want of code.
+* **The `CONNECT` tunnel is verified on Win32, not on Mac OS 9.** A downloader
+  opening one `CONNECT` per file ran 75- and 40-file batches through `:8765`
+  (115+ tunnels): the splice itself was faithful throughout, and the stalls
+  found were the client abandoning slow jobs without closing them, which the
+  bounded idle exemption now reaps. Still no git client for Mac OS 9 to point
+  at it, so the OT half of the tunnel is exercised only by inspection, and
+  `connect_upgrade` (plaintext-in-tunnel re-originated over TLS) is new and
+  awaits its first run. Phase 3's "raw `CONNECT` verification for git" stays
+  open for those reasons rather than for want of code.
 * **Asynchronous OT calls do not copy their arguments.** This bit twice, and it
   is the single most important thing to know when touching this code.
   `OTInetStringToAddress` reads the hostname when the resolver runs, and
