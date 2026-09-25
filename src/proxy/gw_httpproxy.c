@@ -1685,6 +1685,16 @@ static void step_mitm_wait(GWHttpSession *s)
                 why = ": record version did not match the handshake";
             else if (err == 8)
                 why = ": the engine had no randomness, which is our fault";
+            /*
+             * No error at all: the browser hung up having sent neither a
+             * record nor an alert, so BearSSL has nothing to report and the
+             * line would otherwise read "(BearSSL 0)". Stopping is
+             * ordinary -- pressing Stop or refusing the certificate does it
+             * -- but it is also exactly what a client that never spoke TLS
+             * looks like, and the two cannot be told apart from here.
+             */
+            else if (err == 0)
+                why = ": it closed without sending a record or an alert";
             else if (err > 512)
                 why = ": we sent a fatal alert";
             else if (err > 256)

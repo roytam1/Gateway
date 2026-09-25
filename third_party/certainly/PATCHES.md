@@ -1145,3 +1145,64 @@ so only the pre-negotiation flight is affected and everything after
 ServerHello is byte-identical to before. Unconditional -- 03 01 first is
 the ecosystem convention, not a workaround, so every connection gets it,
 not just tunnels.
+
+---
+
+## §33 — a peer that hung up mid-handshake waited out the 30-second timeout
+
+*Certainly patch, in `src/certainly.c` (`MacTLS_Pump()`,
+`tls13_pump_handshake()`, `MacTLS_GetVersion()`), `src/server.c`
+(`MacTLS_ServerPump()`) and `src/transport_win32.c` (`ct_transport_adopt()`,
+`ct_transport_send()`).*
+
+`ct_transport_recv()` reports an orderly EOF as `0` with `peerClosed` set
+(`transport_win32.c:311`), and the header comment says so explicitly: *"The
+peer closed its side. The interface reports that through
+`ct_transport_peer_closed()`, not through this return value."* A `WSAECONNRESET`
+lands the same way. Both close tests were written against the other
+convention -- `if (n < 0) { if (ct_transport_peer_closed(...)) closed; }` --
+so EOF, which is never negative, fell through both of them, `handshake_step`
+kept answering `WantRead`, and nothing observed the FIN at all.
+
+What the caller saw was therefore the timeout, not the close:
+
+```c
+if (ctx->state == kMacTLS_Handshaking) {
+    if ((uint32_t)TickCount() - ctx->handshake_start_ticks > 30 * 60) {
+        ctx->state = kMacTLS_Error;
+        ctx->error = kMacTLS_ErrHandshake;
+```
+
+`br_ssl_engine_last_error()` is still 0 -- the engine never failed, it was
+waiting -- so `MacTLS_GetBearSSLError()` returns 0 and `GWStream_Describe()`
+produces `TLS handshake failed [connected, OT 0, TLS 0, name unresolved]`.
+Every word of that is wrong in a different direction. `connected` comes from
+`MacTLS_GetPhase()`, which reads the *transport* state, and a transport that
+has received a FIN is still `kCTransport_Connected` -- `peerClosed` is a
+separate flag. `OT 0` and `TLS 0` are both true: there is genuinely no error
+anywhere, only a peer nobody asked. And `name unresolved` is `t->addr`, which
+`ct_transport_adopt()` never fills in, because an adopted socket skipped the
+resolve step that would have set it.
+
+The fix moves the close test out of the `n < 0` arm in both handshake paths,
+so it runs on `n == 0` too. The TLS 1.3 path already had the right rule
+written down -- drain `tls13_recv_buf` before declaring the close, since
+partial data can be sitting in it -- it was simply unreachable, because the
+only way in was a negative return. On the BearSSL path the engine's own
+buffer holds at most an incomplete record the peer will never finish, so
+closing there loses nothing. `MacTLS_GetVersion()` also stops answering only
+in `Connected`: `session.version` is set the instant a ServerHello arrives,
+and a peer that sends one and then hangs up now reports the version it chose
+rather than "without answering the ClientHello".
+
+Two supporting changes. `ct_transport_send()` sets `peerClosed` on
+`WSAECONNRESET`/`WSAECONNABORTED`, so the send arm's existing close test can
+fire before a recv has ever run. `ct_transport_adopt()` calls `getpeername()`
+so an adopted connection names its peer instead of reporting that nothing
+resolved it.
+
+The same silence was seen from a TLS 1.2-only far end holding a TLS 1.3
+ClientHello, and the two were indistinguishable in the log for the same
+reason -- nothing had arrived to distinguish them. This is what made that
+case readable: the tap shows zero bytes back, and now so does the log,
+immediately, instead of 30 seconds later under an error name.

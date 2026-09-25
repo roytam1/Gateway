@@ -168,12 +168,19 @@ MacTLS_State MacTLS_ServerPump(MacTLS_Server *s)
             n = ct_transport_recv(s->transport, buf, len);
             if (n > 0) {
                 br_ssl_engine_recvrec_ack(&s->sc.eng, (size_t)n);
+            } else if (ct_transport_peer_closed(s->transport)) {
+                /*
+                 * EOF comes back as n == 0 with peer_closed set, not as
+                 * n < 0 (transport_win32.c). A close test inside the
+                 * n < 0 arm never fires on that, and a browser that stops
+                 * the handshake -- Stop, or a rejected certificate -- then
+                 * hangs the MITM session until some other timeout. Same
+                 * reason and same fix as the client engine in certainly.c.
+                 */
+                br_ssl_engine_close(&s->sc.eng);
+                s->state = kMacTLS_Closed;
+                return s->state;
             } else if (n < 0) {
-                if (ct_transport_peer_closed(s->transport)) {
-                    br_ssl_engine_close(&s->sc.eng);
-                    s->state = kMacTLS_Closed;
-                    return s->state;
-                }
                 s->state = kMacTLS_Error;
                 s->error = kMacTLS_ErrRead;
                 return s->state;

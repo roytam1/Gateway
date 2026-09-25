@@ -613,16 +613,22 @@ static MacTLS_State tls13_pump_handshake(MacTLS_Context *ctx)
                               space);
         if (n > 0) {
             ctx->tls13_recv_len += (size_t)n;
-        } else if (n < 0) {
+        } else {
             /*
-             * OT reports no more data. If the peer has closed,
-             * we may still have pending data in tls13_recv_buf
-             * that needs to be processed. Don't return Closed
-             * immediately — fall through to handshake_step to
-             * drain the buffer. If there's no pending data AND
-             * no handshake work to do, the handshake code will
-             * report WantRead and we'll come back here next time
-             * with still no data — at which point we mark Closed.
+             * n == 0 means "nothing available right now" and n < 0 means a
+             * hard failure. An orderly EOF is reported as n == 0 with
+             * ct_transport_peer_closed() set (transport_win32.c), NOT as
+             * n < 0 — so a close check that lives only in the n < 0 arm
+             * never fires, the state machine returns WantRead for ever,
+             * and the handshake dies on the 30-second timeout below
+             * instead of on the peer's FIN. Test it on both arms.
+             *
+             * If the peer has closed we may still have pending data in
+             * tls13_recv_buf, so don't return Closed immediately — fall
+             * through to handshake_step to drain the buffer. If there's
+             * no pending data AND no handshake work to do, the handshake
+             * code reports WantRead and the next pump sees the same
+             * condition and closes.
              */
             if (ct_transport_peer_closed(ctx->transport) &&
                 ctx->tls13_recv_len == 0 &&
@@ -630,7 +636,7 @@ static MacTLS_State tls13_pump_handshake(MacTLS_Context *ctx)
                 ctx->state = kMacTLS_Closed;
                 return ctx->state;
             }
-            if (!ct_transport_peer_closed(ctx->transport)) {
+            if (n < 0 && !ct_transport_peer_closed(ctx->transport)) {
                 ctx->state = kMacTLS_Error;
                 ctx->error = kMacTLS_ErrRead;
                 return ctx->state;
@@ -1244,13 +1250,22 @@ MacTLS_State MacTLS_Pump(MacTLS_Context *ctx)
             n = ct_transport_recv(ctx->transport, buf, len);
             if (n > 0) {
                 br_ssl_engine_recvrec_ack(&ctx->sc.eng, n);
+            } else if (ct_transport_peer_closed(ctx->transport)) {
+                /*
+                 * Peer gone. An orderly EOF comes back as n == 0 with
+                 * peer_closed set, not as n < 0 (transport_win32.c), so this
+                 * test has to sit outside the n < 0 arm — otherwise nothing
+                 * ever notices the FIN and the handshake rides out its
+                 * 30-second timeout, reporting kMacTLS_ErrHandshake with
+                 * br_ssl_engine_last_error() still 0. Anything the engine
+                 * had buffered is by definition an incomplete record the
+                 * peer will never finish, so closing loses nothing.
+                 */
+                br_ssl_engine_close(&ctx->sc.eng);
+                ctx->state = kMacTLS_Closed;
+                return ctx->state;
             } else if (n < 0) {
-                /* Recv failed — if peer closed, treat as normal close */
-                if (ct_transport_peer_closed(ctx->transport)) {
-                    br_ssl_engine_close(&ctx->sc.eng);
-                    ctx->state = kMacTLS_Closed;
-                    return ctx->state;
-                }
+                /* Recv failed for a reason that is not a close */
                 ctx->state = kMacTLS_Error;
                 ctx->error = kMacTLS_ErrRead;
                 return ctx->state;
@@ -1659,11 +1674,27 @@ int MacTLS_GetBearSSLError(const MacTLS_Context *ctx)
 
 MacTLS_Version MacTLS_GetVersion(const MacTLS_Context *ctx)
 {
+    unsigned v;
+
     /* Only meaningful once the handshake has completed. tls13_active is
      * latched true after a successful TLS 1.3 handshake; otherwise the
      * connection ran through BearSSL's T0 engine, which we pin to 1.2. */
-    if (ctx->state != kMacTLS_Connected) return kMacTLS_VersionUnknown;
-    return ctx->tls13_active ? kMacTLS_Version13 : kMacTLS_Version12;
+    if (ctx == NULL) return kMacTLS_VersionUnknown;
+    if (ctx->state == kMacTLS_Connected) {
+        return ctx->tls13_active ? kMacTLS_Version13 : kMacTLS_Version12;
+    }
+    /*
+     * A peer may send its ServerHello and then hang up. state is no longer
+     * Connected by then, so the test above gives back Unknown and the
+     * caller's log claims the connection never answered the ClientHello
+     * when it plainly did. BearSSL writes the negotiated version into
+     * session.version the moment the ServerHello arrives, so read it from
+     * there while the session is still around. 0 means no ServerHello was
+     * ever received, which is the case the caller wants to be told apart.
+     */
+    if (ctx->tls13_active) return kMacTLS_Version13;
+    v = br_ssl_engine_get_version(&ctx->sc.eng);
+    return (v == BR_TLS12) ? kMacTLS_Version12 : kMacTLS_VersionUnknown;
 }
 
 /* ── Configuration ── */

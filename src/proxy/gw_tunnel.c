@@ -702,8 +702,35 @@ static void session_step(GWTunnelSession *s)
                    ver == 13 ? "TLS 1.3" : ver == 12 ? "TLS 1.2" : "TLS",
                    s->remoteHost, (unsigned)s->remotePort);
             s->state = kTNLSplice;
-        } else if (s->up.state == kGWStreamError ||
-                   s->up.state == kGWStreamClosed) {
+        } else if (s->up.state == kGWStreamClosed) {
+            char why[160];
+            int  ver = GWStream_TlsVersion(&s->up);
+
+            /*
+             * The far leg stopped mid-handshake. Describe() still reports
+             * "ok" for this: a peer that hangs up with no record and no
+             * alert never fails the session, it merely stops, so the error
+             * slot stays empty and the line reads "ok [closed, OT 0, TLS 0,
+             * ...]" -- the one failure in the whole tunnel that produced no
+             * log about it. Say what happened, and which of the two shapes
+             * it was. Silence-then-FIN is what a TLS 1.2-only far end does
+             * with a TLS 1.3 ClientHello, and what a proxy does when it
+             * cannot reach the target it just 200ed; a tap on the wire is
+             * the only other way to tell them apart, and there is no
+             * handshake detail to report either way.
+             */
+            gw_log("tunnel #%ld %s", s->id,
+                   GWStream_Describe(&s->up, why, sizeof(why)));
+            if (ver == 0)
+                gw_log("tunnel #%ld %s:%u closed the connection without "
+                       "answering the ClientHello", s->id,
+                       s->remoteHost, (unsigned)s->remotePort);
+            else
+                gw_log("tunnel #%ld %s:%u closed mid-handshake after its "
+                       "ServerHello chose TLS %d", s->id,
+                       s->remoteHost, (unsigned)s->remotePort, ver);
+            tunnel_fail(s, "far end closed the connection during the TLS handshake");
+        } else if (s->up.state == kGWStreamError) {
             char why[160];
             gw_log("tunnel #%ld %s", s->id,
                    GWStream_Describe(&s->up, why, sizeof(why)));
