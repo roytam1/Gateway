@@ -59,6 +59,12 @@ typedef struct {
 
     char          tx[GW_TUNNEL_TX];     /* handshake bytes still to send */
     size_t        txLen, txSent;
+    /*
+     * Split offset for the HTTP CONNECT request: the request line goes
+     * first, the headers on the next pump -- socat's exact send pattern
+     * (its blank line follows ~a millisecond later). 0 disables.
+     */
+    size_t        txSplit;
     unsigned char rx[GW_TUNNEL_RX];     /* handshake bytes received */
     size_t        rxLen;
     int           socksPhase;           /* 0 greeting, 1 connection request */
@@ -121,14 +127,26 @@ static long fill(GWStream *s, char *buf, size_t *len, size_t cap)
 /* Raw-conn versions for the handshake, before any stream exists. */
 static long conn_flush(GWTunnelSession *s)
 {
-    while (s->txSent < s->txLen) {
+    size_t cap = s->txLen;
+
+    /*
+     * First flight is the request line alone; the rest follows on the
+     * next pump, normally its own segment -- socat's shape, which one
+     * proxy treats differently from a single write carrying the whole
+     * head. Costs one extra pump (about a millisecond).
+     */
+    if (s->txSplit > 0 && s->txSent < s->txSplit)
+        cap = s->txSplit;
+
+    while (s->txSent < cap) {
         long n = GWConn_Send(s->conn, s->tx + s->txSent,
-                             s->txLen - s->txSent);
+                             cap - s->txSent);
         if (n < 0) return -1;
         if (n == 0) return 0;
         s->txSent += (size_t)n;
         s->lastActivity = GWNet_Ticks();
     }
+    if (cap < s->txLen) return 0;       /* remainder goes next pump */
     return 1;
 }
 
@@ -239,6 +257,9 @@ static int build_handshake(GWTunnelSession *s)
                 gw_log("tunnel #%ld sending %.*s%s%s", s->id, (int)eol,
                        s->tx, bare ? " (bare)" : "",
                        auth ? " +auth" : "");
+                /* Request line first, headers next pump (see conn_flush). */
+                if (eol + 2 < s->txLen)
+                    s->txSplit = eol + 2;
             }
         }
     } else if (s->proxyKind == GW_FWD_SOCKS5) {
