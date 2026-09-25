@@ -37,6 +37,7 @@ typedef enum {
     kTNLFree = 0,
     kTNLProxyConnect,   /* GWConn opening, to the proxy or the remote */
     kTNLProxyHello,     /* proxy handshake bytes on the wire */
+    kTNLSettleWait,     /* proxy accepted; waiting out its setup race */
     kTNLSpliceWait,     /* TLS handshake running on the adopted stream */
     kTNLSplice,         /* bytes both ways until EOF or error */
     kTNLFlushClose,
@@ -68,6 +69,7 @@ typedef struct {
     char         *pq;    size_t pLen, pSent; /* to far leg */
 
     unsigned long lastActivity;
+    unsigned long settleUntil;  /* ticks: when kTNLSettleWait may proceed */
 } GWTunnelSession;
 
 static GWTunnelSession *sTunnel;
@@ -205,20 +207,39 @@ static int build_handshake(GWTunnelSession *s)
             auth = b64;
         }
         /*
-         * Bare (no Host line) on request, exactly what socat sends: one
-         * proxy answered the Host-carrying form with 200 and then stalled
-         * the tunnel past the handshake timeout, while passing the bare
-         * form. Default keeps Host.
+         * Bare (no Host line) on request when tunnel_host_header is 0:
+         * exactly what socat sends (request line, auth, blank line).
+         * HTTP/1.0 does not require Host; the authority is in the
+         * request line.
          */
-        if (GWConfig_Num("tunnel_host_header", 1) != 0)
-            s->txLen = gw_fwd_connect_req(s->remoteHost, s->remotePort, auth,
-                                          s->tx, sizeof(s->tx));
-        else
-            s->txLen = gw_fwd_connect_req_bare(s->remoteHost, s->remotePort,
+        {
+            int bare = (GWConfig_Num("tunnel_host_header", 1) == 0);
+
+            if (!bare)
+                s->txLen = gw_fwd_connect_req(s->remoteHost, s->remotePort,
                                               auth, s->tx, sizeof(s->tx));
-        if (s->txLen == 0) {
-            gw_log("tunnel #%ld cannot shape CONNECT request", s->id);
-            return 0;
+            else
+                s->txLen = gw_fwd_connect_req_bare(s->remoteHost,
+                                                  s->remotePort, auth,
+                                                  s->tx, sizeof(s->tx));
+            if (s->txLen == 0) {
+                gw_log("tunnel #%ld cannot shape CONNECT request", s->id);
+                return 0;
+            }
+            /*
+             * The request line only: credentials never reach the log.
+             * Proves which form actually ran, since the log otherwise
+             * cannot tell the Host form from the bare one.
+             */
+            {
+                size_t eol = 0;
+
+                while (eol < s->txLen && s->tx[eol] != '\r' &&
+                       s->tx[eol] != '\n') eol++;
+                gw_log("tunnel #%ld sending %.*s%s%s", s->id, (int)eol,
+                       s->tx, bare ? " (bare)" : "",
+                       auth ? " +auth" : "");
+            }
         }
     } else if (s->proxyKind == GW_FWD_SOCKS5) {
         /*
@@ -366,6 +387,9 @@ static void begin_tls_or_splice(GWTunnelSession *s)
 /* Handshake steps                                                     */
 /* ------------------------------------------------------------------ */
 
+static void proxy_ready(GWTunnelSession *s);
+static void begin_tls_or_splice(GWTunnelSession *s);
+
 static void step_proxy_connect(GWTunnelSession *s)
 {
     switch (GWConn_Pump(s->conn)) {
@@ -449,6 +473,50 @@ static void step_http_hello(GWTunnelSession *s)
     }
     gw_log("tunnel #%ld proxy CONNECT to %s:%u established", s->id,
            s->remoteHost, (unsigned)s->remotePort);
+    {
+        /* Name the reply beyond its status: chained proxies (Via) tell
+         * apart backends that share one address, and a 200 that differs
+         * between two clients is the whole diagnosis when one stalls. */
+        size_t viaLen = 0, eol = 0;
+        const char *via;
+        char status[80], node[80];
+
+        while (eol < head_len && s->rx[eol] != '\r' && s->rx[eol] != '\n')
+            eol++;
+        gw_copy_n(status, sizeof(status), (const char *)s->rx, eol);
+        via = gw_header_find((const char *)s->rx, head_len, "Via", &viaLen);
+        if (via != NULL && viaLen > 0) {
+            gw_copy_n(node, sizeof(node), via, viaLen);
+            gw_log("tunnel #%ld proxy said: %s (Via: %s)",
+                   s->id, status, node);
+        } else {
+            gw_log("tunnel #%ld proxy said: %s", s->id, status);
+        }
+    }
+    proxy_ready(s);
+}
+
+/*
+ * The proxy handshake is done; the tunnel is supposedly live. Either start
+ * TLS at once or let the tunnel settle first: one proxy answers 200 before
+ * its upstream splice is ready, and the first flight sent inside a
+ * millisecond falls into the void with no RST and no reply -- 30 seconds
+ * of silence that reads as a TLS failure. Waiting past the race once per
+ * connection costs nothing next to the handshake itself.
+ */
+static void proxy_ready(GWTunnelSession *s)
+{
+    long ms = GWConfig_Num("tunnel_settle_ms", 0);
+
+    if (ms < 0) ms = 0;
+    if (ms > 30000) ms = 30000;
+    if (s->proxyKind != GW_FWD_NONE && ms > 0) {
+        s->settleUntil = GWNet_Ticks() + (unsigned long)(ms * 60 / 1000);
+        s->lastActivity = GWNet_Ticks();
+        gw_log("tunnel #%ld letting the tunnel settle %ldms", s->id, ms);
+        s->state = kTNLSettleWait;
+        return;
+    }
     begin_tls_or_splice(s);
 }
 
@@ -508,7 +576,7 @@ static void step_socks_hello(GWTunnelSession *s)
     }
     gw_log("tunnel #%ld SOCKS proxy to %s:%u established", s->id,
            s->remoteHost, (unsigned)s->remotePort);
-    begin_tls_or_splice(s);
+    proxy_ready(s);
 }
 
 /* ------------------------------------------------------------------ */
@@ -596,6 +664,14 @@ static void session_step(GWTunnelSession *s)
     case kTNLProxyHello:
         if (s->proxyKind == GW_FWD_HTTP) step_http_hello(s);
         else step_socks_hello(s);
+        break;
+
+    case kTNLSettleWait:
+        /* Signed compare so a tick-counter wrap still ends the wait. */
+        if ((long)(GWNet_Ticks() - s->settleUntil) >= 0) {
+            s->lastActivity = GWNet_Ticks();
+            begin_tls_or_splice(s);
+        }
         break;
 
     case kTNLSpliceWait:

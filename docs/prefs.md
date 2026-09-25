@@ -208,6 +208,7 @@ exactly as if the tunnel were not there.
 | `tunnel_sni` | empty | Diagnosis only: what the handshake sends as SNI. Empty (the default) sends the far hostname. `none` omits SNI entirely; anything else is sent instead. One corporate proxy answered a nameless ClientHello and stalled one carrying the hostname, with no other difference on the wire. |
 | `tunnel_proxy` | `none` | `none`, `http` (CONNECT, with `Proxy-Authorization` when a user is set) or `socks5` (no-auth only). Anything else drops the client and logs the valid values. |
 | `tunnel_host_header` | `1` | Send a `Host:` line in the proxy CONNECT request. `0` omits it (request line, auth, blank line — byte-for-byte what socat sends). One proxy 200ed the `Host` form and then stalled the tunnel past the handshake timeout while passing the bare form. |
+| `tunnel_settle_ms` | `0` | Diagnosis: milliseconds to wait after the proxy accepts before starting TLS. One proxy answered 200 before its upstream splice was ready, so a first flight sent inside a millisecond fell into the void with no RST and no reply; delaying past that race (try 2000) tells a setup race apart from a byte-level block. |
 | `tunnel_proxy_host` | — | The proxy. Required unless `tunnel_proxy` is `none`. |
 | `tunnel_proxy_port` | `8080` / `1080` | The proxy port: `8080` for `http`, `1080` for `socks5`. Set explicitly to override. |
 | `tunnel_proxy_user`, `tunnel_proxy_pass` | empty | HTTP proxy credentials (Basic). A SOCKS5 login is not implemented: setting one refuses the connection loudly rather than connecting anonymously. |
