@@ -1101,5 +1101,26 @@ fallback reset, and the 1.3 pump. It must run before the first Pump, like
 sites do. The 1.3 ClientHello builder treats a NULL name as "omit the SNI
 extension" rather than dereferencing it -- the one `strlen(hostname)` in
 that file assumed a name always exists, which an omitted SNI disproves on
-the first handshake. The tunnel logs which SNI it sends; the default (pref
-unset) is unchanged.
+the first handshake. `MacTLS_SetSNI()` re-stamps the §32 compat version
+after its own reset, which would otherwise undo it. The tunnel logs which
+SNI it sends; the default (pref unset) is unchanged.
+
+## §32 — the 1.2 ClientHello record went out as 03 03 instead of 03 01
+
+*Certainly patch, in `src/certainly.c` (`client_first_record_compat()`).*
+
+`br_ssl_client_reset()` stamps `version_min` into `version_out`, and the
+1.2-only pin in `setup_bearssl()` makes that 0x0303 -- so BearSSL's
+ClientHello record reads `16 03 03` where OpenSSL, browsers, and
+Certainly's own 1.3 stack all send `16 03 01`. A version-intolerant
+middlebox that only forwards 03 01 first records drops it silently: same
+destination, 200 from the proxy, then 30 seconds of nothing, while an
+OpenSSL hello through the same tunnel flows. The direct path never showed
+it because servers accept either.
+
+After each client reset the version is stamped back to `BR_TLS10`.
+`read-ServerHello` overwrites `version_out` with the negotiated version
+(`ssl_hs_client.t0`), so only the pre-negotiation flight is affected and
+everything after ServerHello is byte-identical to before. Unconditional --
+03 01 first is the ecosystem convention, not a workaround, so every
+connection gets it, not just tunnels.

@@ -216,6 +216,23 @@ static void setup_bearssl(MacTLS_Context *ctx)
 
 /* ── Connection lifecycle ── */
 
+/*
+ * First-record compatibility (§32). br_ssl_client_reset() stamps
+ * version_min (0x0303 here, from the 1.2-only pin in setup_bearssl()) into
+ * version_out, so the ClientHello record goes out as 16 03 03 -- where
+ * every other stack sends 16 03 01 and version-intolerant middleboxes only
+ * forward 03 01. Stamping 0x0301 back after each reset reproduces the
+ * ecosystem convention; read-ServerHello overwrites version_out with the
+ * negotiated version (ssl_hs_client.t0), so only the pre-negotiation
+ * flight is affected and nothing after it changes.
+ */
+static void client_first_record_compat(MacTLS_Context *ctx)
+{
+    ctx->sc.eng.version_out = BR_TLS10;
+}
+
+/* ── Connection lifecycle ── */
+
 MacTLS_Context *MacTLS_Create(const char *host, uint16_t port)
 {
     return MacTLS_CreateWithConfig(host, port, NULL);
@@ -352,6 +369,7 @@ MacTLS_Context *MacTLS_CreateOnEndpointTLS12(const char *host, CTSocket sock)
         ctx->error = kMacTLS_ErrHandshake;
         return ctx;
     }
+    client_first_record_compat(ctx);
 
     ctx->force_tls12 = true;
     ctx->tls13_active = false;
@@ -506,6 +524,14 @@ void MacTLS_SetSNI(MacTLS_Context *ctx, const char *sni)
     if (!br_ssl_client_reset(&ctx->sc, eff_sni(ctx), 0)) {
         ctx->state = kMacTLS_Error;
         ctx->error = kMacTLS_ErrHandshake;
+    } else {
+        /*
+         * The reset stamped version_min back over the compat value, so
+         * stamp it again -- otherwise SetSNI silently undoes §32, which
+         * is exactly what the tap capture caught (03 03 on the wire
+         * despite the fix).
+         */
+        client_first_record_compat(ctx);
     }
 }
 
@@ -708,6 +734,7 @@ static MacTLS_State tls13_pump_handshake(MacTLS_Context *ctx)
                 ctx->error = kMacTLS_ErrHandshake;
                 return ctx->state;
             }
+            client_first_record_compat(ctx);
 
             /* Mark as NOT TLS 1.3 — future pumps use BearSSL path */
             ctx->tls13_active = false;
