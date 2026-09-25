@@ -24,8 +24,9 @@ int gw_fwd_kind(const char *name)
     return -1;
 }
 
-size_t gw_fwd_connect_req(const char *host, unsigned port, const char *b64,
-                          char *out, size_t cap)
+static size_t gw_fwd_connect_req_impl(const char *host, unsigned port,
+                                      const char *b64, char *out, size_t cap,
+                                      int with_host)
 {
     int n;
 
@@ -33,19 +34,33 @@ size_t gw_fwd_connect_req(const char *host, unsigned port, const char *b64,
         return 0;
     if (out == NULL || cap == 0) return 0;
 
-    if (b64 != NULL && b64[0] != '\0')
-        n = snprintf(out, cap,
-                     "CONNECT %s:%u HTTP/1.0\r\n"
-                     "Host: %s:%u\r\n"
-                     "Proxy-Authorization: Basic %s\r\n"
-                     "\r\n",
-                     host, port, host, port, b64);
-    else
-        n = snprintf(out, cap,
-                     "CONNECT %s:%u HTTP/1.0\r\n"
-                     "Host: %s:%u\r\n"
-                     "\r\n",
-                     host, port, host, port);
+    if (b64 != NULL && b64[0] != '\0') {
+        if (with_host)
+            n = snprintf(out, cap,
+                         "CONNECT %s:%u HTTP/1.0\r\n"
+                         "Host: %s:%u\r\n"
+                         "Proxy-Authorization: Basic %s\r\n"
+                         "\r\n",
+                         host, port, host, port, b64);
+        else
+            n = snprintf(out, cap,
+                         "CONNECT %s:%u HTTP/1.0\r\n"
+                         "Proxy-Authorization: Basic %s\r\n"
+                         "\r\n",
+                         host, port, b64);
+    } else {
+        if (with_host)
+            n = snprintf(out, cap,
+                         "CONNECT %s:%u HTTP/1.0\r\n"
+                         "Host: %s:%u\r\n"
+                         "\r\n",
+                         host, port, host, port);
+        else
+            n = snprintf(out, cap,
+                         "CONNECT %s:%u HTTP/1.0\r\n"
+                         "\r\n",
+                         host, port);
+    }
 
     /*
      * snprintf returns what would have been written: n >= cap means the
@@ -54,6 +69,26 @@ size_t gw_fwd_connect_req(const char *host, unsigned port, const char *b64,
      */
     if (n <= 0 || (size_t)n >= cap) return 0;
     return (size_t)n;
+}
+
+size_t gw_fwd_connect_req(const char *host, unsigned port, const char *b64,
+                          char *out, size_t cap)
+{
+    return gw_fwd_connect_req_impl(host, port, b64, out, cap, 1);
+}
+
+/*
+ * The same request without the Host line: request line, optional
+ * Proxy-Authorization, blank line. socat sends exactly this shape, and one
+ * BlueCoat-style proxy answered it while stalling the Host-carrying form
+ * past the handshake timeout -- same 200 either way, different tunnel
+ * after it. HTTP/1.0 does not require Host (the authority is already in
+ * the request line), so the bare form is the safer wire shape here.
+ */
+size_t gw_fwd_connect_req_bare(const char *host, unsigned port,
+                               const char *b64, char *out, size_t cap)
+{
+    return gw_fwd_connect_req_impl(host, port, b64, out, cap, 0);
 }
 
 int gw_fwd_connect_reply(const char *buf, size_t len,

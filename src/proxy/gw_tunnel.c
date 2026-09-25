@@ -204,8 +204,18 @@ static int build_handshake(GWTunnelSession *s)
             }
             auth = b64;
         }
-        s->txLen = gw_fwd_connect_req(s->remoteHost, s->remotePort, auth,
-                                      s->tx, sizeof(s->tx));
+        /*
+         * Bare (no Host line) on request, exactly what socat sends: one
+         * proxy answered the Host-carrying form with 200 and then stalled
+         * the tunnel past the handshake timeout, while passing the bare
+         * form. Default keeps Host.
+         */
+        if (GWConfig_Num("tunnel_host_header", 1) != 0)
+            s->txLen = gw_fwd_connect_req(s->remoteHost, s->remotePort, auth,
+                                          s->tx, sizeof(s->tx));
+        else
+            s->txLen = gw_fwd_connect_req_bare(s->remoteHost, s->remotePort,
+                                              auth, s->tx, sizeof(s->tx));
         if (s->txLen == 0) {
             gw_log("tunnel #%ld cannot shape CONNECT request", s->id);
             return 0;

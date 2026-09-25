@@ -207,6 +207,7 @@ exactly as if the tunnel were not there.
 | `tunnel_insecure` | `0` | Testing only: accept any certificate on the far leg — wrong name, private CA, expired — without checking. The tunnel then proves only that bytes flow, not who they flow to, so turn it back off afterwards. Never applies to mail. |
 | `tunnel_sni` | empty | Diagnosis only: what the handshake sends as SNI. Empty (the default) sends the far hostname. `none` omits SNI entirely; anything else is sent instead. One corporate proxy answered a nameless ClientHello and stalled one carrying the hostname, with no other difference on the wire. |
 | `tunnel_proxy` | `none` | `none`, `http` (CONNECT, with `Proxy-Authorization` when a user is set) or `socks5` (no-auth only). Anything else drops the client and logs the valid values. |
+| `tunnel_host_header` | `1` | Send a `Host:` line in the proxy CONNECT request. `0` omits it (request line, auth, blank line — byte-for-byte what socat sends). One proxy 200ed the `Host` form and then stalled the tunnel past the handshake timeout while passing the bare form. |
 | `tunnel_proxy_host` | — | The proxy. Required unless `tunnel_proxy` is `none`. |
 | `tunnel_proxy_port` | `8080` / `1080` | The proxy port: `8080` for `http`, `1080` for `socks5`. Set explicitly to override. |
 | `tunnel_proxy_user`, `tunnel_proxy_pass` | empty | HTTP proxy credentials (Basic). A SOCKS5 login is not implemented: setting one refuses the connection loudly rather than connecting anonymously. |

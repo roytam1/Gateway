@@ -1392,6 +1392,10 @@ static void test_fwd(void)
     check_str(req, "CONNECT ssh.example.com:22 HTTP/1.0\r\n"
                    "Host: ssh.example.com:22\r\n"
                    "\r\n", "CONNECT request bytes");
+    n = gw_fwd_connect_req_bare("ssh.example.com", 22, NULL,
+                                req, sizeof(req));
+    check_str(req, "CONNECT ssh.example.com:22 HTTP/1.0\r\n"
+                   "\r\n", "bare CONNECT omits Host, like socat");
     n = gw_fwd_connect_req("ssh.example.com", 22, "dXNlcjpwYXNz",
                            req, sizeof(req));
     check(n > 0 && strstr(req, "Proxy-Authorization: Basic dXNlcjpwYXNz\r\n")

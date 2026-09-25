@@ -89,6 +89,7 @@ tunnel_tls          = 1
 # tunnel_proxy        = none
 # tunnel_proxy_host   = proxy.example.com
 # tunnel_proxy_port   = 8080
+# tunnel_host_header  = 0  # omit Host: from CONNECT, like socat
 # tunnel_proxy_user   =
 # tunnel_proxy_pass   =
 

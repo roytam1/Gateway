@@ -38,6 +38,15 @@ size_t gw_fwd_connect_req(const char *host, unsigned port, const char *b64,
                           char *out, size_t cap);
 
 /*
+ * The same request without the Host line, byte-for-byte what socat sends:
+ * request line, optional Proxy-Authorization, blank line. See
+ * tunnel_host_header; one proxy stalled the Host-carrying form while
+ * passing this one.
+ */
+size_t gw_fwd_connect_req_bare(const char *host, unsigned port,
+                               const char *b64, char *out, size_t cap);
+
+/*
  * Read a proxy's reply to the CONNECT request. Returns 1 once the full head
  * has arrived (status in *code, head length in *head_len), 0 when more bytes
  * are needed, -1 when the reply is not an HTTP status line at all.
