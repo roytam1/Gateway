@@ -1118,9 +1118,30 @@ destination, 200 from the proxy, then 30 seconds of nothing, while an
 OpenSSL hello through the same tunnel flows. The direct path never showed
 it because servers accept either.
 
-After each client reset the version is stamped back to `BR_TLS10`.
-`read-ServerHello` overwrites `version_out` with the negotiated version
-(`ssl_hs_client.t0`), so only the pre-negotiation flight is affected and
-everything after ServerHello is byte-identical to before. Unconditional --
-03 01 first is the ecosystem convention, not a workaround, so every
-connection gets it, not just tunnels.
+**Why the stamp has to ride inside the reset.** The first version of this
+patch set `version_out` *after* `br_ssl_client_reset()` returned, and the
+tap kept showing `03 03`. It had to: `br_ssl_client_reset()` does not just
+reset state, it runs `jump_handshake()` (`ssl_engine.c:1556`) before
+returning, and that processor "never leaves an unfinished outgoing record"
+-- so the ClientHello is assembled and `flush-record()` bakes its 5-byte
+header through `sendpld_flush()` using `version_out` at that instant
+(`ssl_engine.c:1088`). By the time the post-reset stamp ran, the header
+bytes were already fixed in `obuf`. Setting a field the header has already
+copied is a no-op on the wire.
+
+So `client_first_record_compat()` is now the reset itself: it drops
+`version_min` to `BR_TLS10` across the `br_ssl_client_reset()` call, then
+restores it to `BR_TLS12`. `version_min` is the only lever the header
+reads while the reset runs (`ssl_client.c:48`). Its sole other client-side
+consumer is the `read-ServerHello` range check
+(`ssl_hs_client.t0:656`), which runs long after this returns, so the
+1.2-only pin ends up exactly as strict as it was -- a ServerHello asking
+for 0x0301 or 0x0302 still fails. `version_max` is never touched: it
+supplies the ClientHello's `legacy_version` (`ssl_hs_client.t0:462`) and
+the ServerHello upper bound, both staying 0x0303.
+
+`read-ServerHello` overwrites `version_out` with the negotiated version,
+so only the pre-negotiation flight is affected and everything after
+ServerHello is byte-identical to before. Unconditional -- 03 01 first is
+the ecosystem convention, not a workaround, so every connection gets it,
+not just tunnels.

@@ -217,18 +217,41 @@ static void setup_bearssl(MacTLS_Context *ctx)
 /* ── Connection lifecycle ── */
 
 /*
- * First-record compatibility (§32). br_ssl_client_reset() stamps
- * version_min (0x0303 here, from the 1.2-only pin in setup_bearssl()) into
- * version_out, so the ClientHello record goes out as 16 03 03 -- where
- * every other stack sends 16 03 01 and version-intolerant middleboxes only
- * forward 03 01. Stamping 0x0301 back after each reset reproduces the
- * ecosystem convention; read-ServerHello overwrites version_out with the
- * negotiated version (ssl_hs_client.t0), so only the pre-negotiation
- * flight is affected and nothing after it changes.
+ * First-record compatibility (§32), run as the reset itself rather than
+ * after it.
+ *
+ * br_ssl_client_reset() stamps version_min into version_out
+ * (ssl_client.c:48) and then, before it returns, runs jump_handshake()
+ * (ssl_engine.c:1556) -- whose processor "never leaves an unfinished
+ * outgoing record". So the ClientHello is assembled and flush-record()
+ * bakes its 5-byte header through sendpld_flush() using version_out at
+ * that instant (ssl_engine.c:1088). A stamp applied *after* the reset
+ * therefore never reaches the wire; §32 as first written did exactly
+ * that, which is why the tap kept showing 16 03 03.
+ *
+ * version_min is the only lever the header reads while the reset runs, so
+ * it is dropped to 0x0301 across the call and restored straight after. Its
+ * sole other client-side consumer is the read-ServerHello range check
+ * (ssl_hs_client.t0:656), which runs long after this returns, so the
+ * 1.2-only pin from setup_bearssl() ends up exactly as strict as before.
+ * version_max is left untouched: it supplies the ClientHello's
+ * legacy_version (ssl_hs_client.t0:462) and the ServerHello upper bound,
+ * both staying 0x0303.
+ *
+ * Every other stack puts 0x0301 in that header and version-intolerant
+ * middleboxes forward only 03 01, so 03 03 is both unusual and fragile.
+ * read-ServerHello overwrites version_out with the negotiated version, so
+ * only the pre-negotiation flight is affected.
  */
-static void client_first_record_compat(MacTLS_Context *ctx)
+static int client_first_record_compat(MacTLS_Context *ctx, const char *name)
 {
+    int ok;
+
+    ctx->sc.eng.version_min = BR_TLS10;
+    ok = br_ssl_client_reset(&ctx->sc, name, 0);
+    ctx->sc.eng.version_min = BR_TLS12;
     ctx->sc.eng.version_out = BR_TLS10;
+    return ok;
 }
 
 /* ── Connection lifecycle ── */
@@ -364,12 +387,11 @@ MacTLS_Context *MacTLS_CreateOnEndpointTLS12(const char *host, CTSocket sock)
      * setup_bearssl() is its first arming. The reset only fails on a name
      * too long for the engine or an RNG that will not seed.
      */
-    if (!br_ssl_client_reset(&ctx->sc, ctx->host, 0)) {
+    if (!client_first_record_compat(ctx, ctx->host)) {
         ctx->state = kMacTLS_Error;
         ctx->error = kMacTLS_ErrHandshake;
         return ctx;
     }
-    client_first_record_compat(ctx);
 
     ctx->force_tls12 = true;
     ctx->tls13_active = false;
@@ -517,21 +539,14 @@ void MacTLS_SetSNI(MacTLS_Context *ctx, const char *sni)
      * as ordinary initialisation; on the fallback path below the same
      * call re-arms it, so this stays consistent however the handshake
      * proceeds. A reset that fails here fails the context the same way
-     * the other call sites do.
+     * the other call sites do. The §32 first-record stamp rides inside
+     * the reset, so the re-reset cannot unstamp the header.
      */
     br_ssl_engine_set_buffer(&ctx->sc.eng, ctx->iobuf,
                              sizeof(ctx->iobuf), 0);
-    if (!br_ssl_client_reset(&ctx->sc, eff_sni(ctx), 0)) {
+    if (!client_first_record_compat(ctx, eff_sni(ctx))) {
         ctx->state = kMacTLS_Error;
         ctx->error = kMacTLS_ErrHandshake;
-    } else {
-        /*
-         * The reset stamped version_min back over the compat value, so
-         * stamp it again -- otherwise SetSNI silently undoes §32, which
-         * is exactly what the tap capture caught (03 03 on the wire
-         * despite the fix).
-         */
-        client_first_record_compat(ctx);
     }
 }
 
@@ -721,7 +736,7 @@ static MacTLS_State tls13_pump_handshake(MacTLS_Context *ctx)
                                      sizeof(ctx->iobuf), 0);
 
             /* Re-init BearSSL for TLS 1.2 (the T0 engine will drive) */
-            if (!br_ssl_client_reset(&ctx->sc, eff_sni(ctx), 0)) {
+            if (!client_first_record_compat(ctx, eff_sni(ctx))) {
                 /*
                  * Nothing is retryable past this point: the reset only
                  * fails on a name too long for the engine or an RNG that
@@ -734,7 +749,6 @@ static MacTLS_State tls13_pump_handshake(MacTLS_Context *ctx)
                 ctx->error = kMacTLS_ErrHandshake;
                 return ctx->state;
             }
-            client_first_record_compat(ctx);
 
             /* Mark as NOT TLS 1.3 — future pumps use BearSSL path */
             ctx->tls13_active = false;
