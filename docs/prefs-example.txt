@@ -24,6 +24,14 @@ rewrite_https    = 1
 connect_mitm     = 0
 connect_upgrade  = 0
 
+# Reach the web through another proxy instead of dialling each origin.
+# Applies to both Web and Wayback; read once, so restart Gateway after.
+# http_upstream      = none     # none | http (CONNECT) | socks5 (no-auth)
+# http_upstream_host =
+# http_upstream_port = 8080     # 1080 for socks5
+# http_upstream_user =
+# http_upstream_pass =
+
 
 # --------------------------------------------------------- Wayback proxy
 

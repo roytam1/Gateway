@@ -21,7 +21,9 @@
 
 #include "../gw_config.h"
 #include "../gw_core.h"
+#include "../portable/gw_b64.h"
 #include "../portable/gw_chunked.h"
+#include "../portable/gw_fwd.h"
 #include "../portable/gw_http.h"
 #include "../portable/gw_log.h"
 #include "../portable/gw_pac.h"
@@ -35,6 +37,48 @@
 #define GW_RAW_MAX      16384L
 #define GW_OUT_MAX      32768L
 #define GW_MAX_REDIRECT 5
+
+/*
+ * The upstream-proxy handshake (http_upstream) lives in the session struct
+ * rather than in a NewPtr block: it is two short exchanges, it exists for the
+ * length of one connect, and session_reset() memsets the struct anyway.
+ *
+ * 1K each is not a guess. The longest send is a CONNECT with Basic auth: a
+ * 255-byte authority plus a 344-byte base64 of a 256-byte user:pass fits with
+ * room to spare. The longest receive is a SOCKS5 reply at 262 bytes, or an
+ * HTTP status head, which is ordinary header text. Refusing a reply that
+ * still has not ended at 1K costs nothing: no proxy sends a 1K status head,
+ * and failing loudly beats waiting for one.
+ */
+#define GW_PROXY_TX     1024
+#define GW_PROXY_RX     1024
+#define GW_PROXY_USER   128
+
+/*
+ * Upstream-proxy handshake phases. Two independent sequences share one
+ * counter: HTTP is one send and one reply, SOCKS5 is a greeting exchange
+ * followed by a connection exchange. The ranges do not overlap so the phases
+ * can be read off a log line without knowing which proxy is in play.
+ */
+#define GW_PX_HTTP_SEND   0
+#define GW_PX_HTTP_RECV   1
+#define GW_PX_SOCKS_GREET 10
+#define GW_PX_SOCKS_REPLY 11
+#define GW_PX_SOCKS_CONN  12
+#define GW_PX_SOCKS_ACK   13
+
+/*
+ * What the browser gets whenever Gateway cannot open the upstream hop. The
+ * reason string carries the detail to the log; the body only says what
+ * Gateway was trying to do, because neither the origin nor the browser is at
+ * fault and blaming one of them in the page would send the reader to the
+ * wrong place.
+ */
+static const char kUpstream502[] =
+    "HTTP/1.0 502 Bad Gateway\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+    "Gateway: could not start the upstream connection.\r\n";
 
 /*
  * The Internet Archive refuses connections for a few seconds when it is asked
@@ -101,6 +145,7 @@ typedef enum {
     kHPFree = 0,
     kHPRecvRequest,
     kHPConnect,
+    kHPProxyLink,
     kHPSendRequest,
     kHPRecvHead,
     kHPBody,
@@ -136,6 +181,22 @@ typedef struct {
     int           upReusable;               /* framing lets us keep it */
     long          bodyLeft;                 /* -1 when the end is EOF */
     int           redirects;
+
+    /*
+     * The upstream proxy in front of the origin (http_upstream).
+     *
+     * Resolved from the prefs on every dial, since prefs are read once at
+     * launch but a session outlives no particular reading of them. `proxyNext`
+     * is the state the session was heading for before the proxy inserted
+     * itself: the forward path sends a request, a CONNECT splices, and which
+     * of those it is is not something the handshake can work out on its own.
+     */
+    int           proxyPhase;               /* GW_PX_*                        */
+    GWHttpState   proxyNext;
+    char          ptx[GW_PROXY_TX];         /* outbound greeting / CONNECT    */
+    size_t        ptxLen, ptxSent;
+    char          prx[GW_PROXY_RX];         /* inbound reply                  */
+    size_t        prxLen;
 
     char         *chead;                    /* client request head           */
     size_t        cheadLen;
@@ -231,8 +292,16 @@ static int connecting_count(int wayback)
     int i, n = 0;
 
     if (sSessions == NULL) return 0;
+    /*
+     * kHPProxyLink counts for the same reason kHPConnect does: with a proxy
+     * in front, the time spent reaching *it* is the time the origin used to
+     * spend being reached, and leaving it out of the total would let a full
+     * session burst arrive at the proxy at once -- which is the exact
+     * behaviour max_connects exists to prevent, aimed at a different host.
+     */
     for (i = 0; i < sSessionCount; i++)
-        if (sSessions[i].state == kHPConnect &&
+        if ((sSessions[i].state == kHPConnect ||
+             sSessions[i].state == kHPProxyLink) &&
             sSessions[i].wayback == wayback) n++;
     return n;
 }
@@ -692,10 +761,366 @@ static const char *upstream_why(GWHttpSession *s, const char *what,
     return out;
 }
 
+/* ------------------------------------------------------------------ */
+/* The upstream proxy in front of the origin (http_upstream)           */
+/* ------------------------------------------------------------------ */
+
+static void proxy_fail(GWHttpSession *s, const char *reason)
+{
+    session_fail(s, kUpstream502, reason);
+}
+
+/*
+ * The parser wants another byte and there is nowhere to put it.
+ *
+ * gw_fwd_connect_reply() and the SOCKS readers both answer 0 for "still
+ * arriving", which is the answer a caller holding a full buffer cannot act
+ * on. Left alone, that session waits for a reply that will never fit -- so
+ * the one case where waiting is provably pointless is turned into a failure
+ * with a reason.
+ */
+static void proxy_need_more(GWHttpSession *s)
+{
+    if (s->prxLen >= sizeof(s->prx))
+        proxy_fail(s, "upstream proxy sent more than 1K before replying");
+}
+
+/*
+ * The proxy has agreed to carry us. Either that was the whole handshake
+ * (HTTP, or SOCKS5 to a plain origin) or it was only the transport and the
+ * origin's own TLS still has to run -- which is the ordinary upgrade path,
+ * taken now that the socket exists.
+ *
+ * The TLS is with the origin, not with the proxy: SNI and the certificate
+ * check both take the origin's name, exactly as they would have done had we
+ * dialled it directly. The proxy never learns anything but bytes.
+ */
+static void proxy_link_up(GWHttpSession *s)
+{
+    if (s->upTls) {
+        gw_log("#%ld TLS to %s through the upstream proxy", s->id, s->upHost);
+        if (!GWStream_UpgradeToTLS(&s->up, s->upHost)) {
+            proxy_fail(s, "could not start TLS through the upstream proxy");
+            return;
+        }
+        s->state = kHPConnect;
+        return;
+    }
+    s->state = s->proxyNext;
+}
+
+/*
+ * Open the upstream hop: straight to the origin, or to the proxy in prefs
+ * first.
+ *
+ * Returns 1 when a connection is under way and s->state is set -- to `next`,
+ * or to kHPProxyLink when there is a handshake to get through first. Returns
+ * 0 when it could not start, having already failed the session; `directWhy`
+ * is the reason logged for a plain direct dial, and is verbatim what the two
+ * original call sites logged before there was anywhere to chain through.
+ *
+ * s->upHost / s->upPort / s->upTls must already name the origin. Every caller
+ * sets them before dialling, and a failure has to say who was being reached:
+ * upTls rather than a parameter, because all three callers already key their
+ * choice of ConnectTLS off exactly that field.
+ */
+static int upstream_open(GWHttpSession *s, GWHttpState next,
+                         const char *directWhy)
+{
+    char phost[GW_MAX_HOST];
+    int  kind;
+    long pport;
+
+    kind = gw_fwd_kind(GWConfig_Str("http_upstream", "none"));
+    if (kind < 0) {
+        gw_log("#%ld unknown http_upstream (want none, http or socks5)", s->id);
+        proxy_fail(s, "http_upstream in the prefs is not none, http or socks5");
+        return 0;
+    }
+
+    if (kind == GW_FWD_NONE) {
+        if (!(s->upTls ? GWStream_ConnectTLS(&s->up, s->upHost, s->upPort)
+                       : GWStream_ConnectPlain(&s->up, s->upHost, s->upPort))) {
+            session_fail(s, kUpstream502, directWhy);
+            return 0;
+        }
+        s->state = next;
+        return 1;
+    }
+
+    /*
+     * From here on it is the proxy we dial. The host is copied out before
+     * anything else reads a config slot: GWConfig_Str hands back a rotating
+     * set of buffers, so a second lookup is free to reuse the first one's.
+     */
+    {
+        const char *h = GWConfig_Str("http_upstream_host", "");
+
+        if (h[0] == '\0') {
+            gw_log("#%ld http_upstream is set but has no http_upstream_host",
+                   s->id);
+            proxy_fail(s, "http_upstream_host is missing from the prefs");
+            return 0;
+        }
+        gw_copy_n(phost, sizeof(phost), h, strlen(h));
+    }
+
+    pport = GWConfig_Num("http_upstream_port",
+                         kind == GW_FWD_SOCKS5 ? 1080 : 8080);
+    if (pport <= 0 || pport > 65535) {
+        gw_log("#%ld bad http_upstream_port (%ld)", s->id, pport);
+        proxy_fail(s, "http_upstream_port in the prefs is not a port");
+        return 0;
+    }
+
+    /*
+     * No-auth only. RFC 1929 would be twenty more lines, and until they
+     * exist a configured login fails loudly rather than connecting
+     * anonymously -- which the log could not tell apart from a proxy that
+     * simply does not ask. Same rule as tunnel_proxy.
+     */
+    if (kind == GW_FWD_SOCKS5 &&
+        GWConfig_Str("http_upstream_user", "")[0] != '\0') {
+        gw_log("#%ld SOCKS5 username/password is not implemented", s->id);
+        proxy_fail(s, "a SOCKS5 login is configured but not implemented");
+        return 0;
+    }
+
+    s->proxyNext = next;
+    s->ptxSent = 0;
+    s->prxLen = 0;
+
+    if (kind == GW_FWD_SOCKS5) {
+        size_t n = gw_fwd_socks_greet((unsigned char *)s->ptx, sizeof(s->ptx));
+
+        if (n == 0) {
+            proxy_fail(s, "cannot shape the SOCKS greeting");
+            return 0;
+        }
+        s->ptxLen = n;
+        s->proxyPhase = GW_PX_SOCKS_GREET;
+    } else {
+        const char *user = GWConfig_Str("http_upstream_user", "");
+        const char *auth = NULL;
+        char        b64[GW_PROXY_USER * 3];   /* base64 of 2*user + ':' */
+        char        creds[GW_PROXY_USER * 2 + 1];
+        size_t      n;
+
+        b64[0] = '\0';
+        if (user[0] != '\0') {
+            char userCopy[GW_PROXY_USER], passCopy[GW_PROXY_USER];
+            const char *pw;
+
+            /*
+             * Checked before it is copied, not after: gw_copy_n() truncates
+             * silently, and a shortened password would then be encoded and
+             * sent as though it were right -- with no way to tell 407 apart
+             * from a proxy that simply dislikes us.
+             *
+             * user first, then pass: GWConfig_Str rotates its buffers, so
+             * neither pointer may outlive the lookup after it.
+             */
+            if (strlen(user) >= sizeof(userCopy)) {
+                gw_log("#%ld http_upstream_user is longer than %d bytes",
+                       s->id, GW_PROXY_USER - 1);
+                proxy_fail(s, "http_upstream_user is too long");
+                return 0;
+            }
+            gw_copy_n(userCopy, sizeof(userCopy), user, strlen(user));
+
+            pw = GWConfig_Str("http_upstream_pass", "");
+            if (strlen(pw) >= sizeof(passCopy)) {
+                gw_log("#%ld http_upstream_pass is longer than %d bytes",
+                       s->id, GW_PROXY_USER - 1);
+                proxy_fail(s, "http_upstream_pass is too long");
+                return 0;
+            }
+            gw_copy_n(passCopy, sizeof(passCopy), pw, strlen(pw));
+
+            snprintf(creds, sizeof(creds), "%s:%s", userCopy, passCopy);
+            if (gw_b64_encode(creds, strlen(creds), b64, sizeof(b64)) == 0) {
+                gw_log("#%ld cannot encode upstream proxy credentials", s->id);
+                proxy_fail(s, "cannot base64 the http_upstream credentials");
+                return 0;
+            }
+            auth = b64;
+        }
+
+        /*
+         * Bare: request line, optional auth, blank line -- no Host. HTTP/1.0
+         * does not require Host, the authority is already in the request
+         * line, and this is the shape that has never stalled on a proxy that
+         * answers the other one and then says nothing.
+         */
+        n = gw_fwd_connect_req_bare(s->upHost, s->upPort, auth,
+                                    s->ptx, sizeof(s->ptx));
+        if (n == 0) {
+            proxy_fail(s, "cannot shape the upstream CONNECT request");
+            return 0;
+        }
+        s->ptxLen = n;
+        s->proxyPhase = GW_PX_HTTP_SEND;
+    }
+
+    gw_log("#%ld via upstream proxy %s:%ld (%s)", s->id, phost, pport,
+           kind == GW_FWD_SOCKS5 ? "socks5" : "http");
+
+    if (!GWStream_ConnectPlain(&s->up, phost, (UInt16)pport)) {
+        proxy_fail(s, "upstream proxy connect failed to start");
+        return 0;
+    }
+    s->state = kHPProxyLink;
+    return 1;
+}
+
+/*
+ * Drive one exchange of the upstream-proxy handshake.
+ *
+ * Called only from kHPProxyLink, where s->up has been pumped at the top of
+ * session_step. Everything here is non-blocking and re-entrant: a partial
+ * write or a reply still arriving simply returns and is picked up next tick,
+ * which is the whole reason the phases are in the struct rather than in a
+ * loop.
+ */
+static void step_proxy_handshake(GWHttpSession *s)
+{
+    long n;
+
+    if (s->up.state != kGWStreamReady) {
+        if (s->up.state == kGWStreamError || s->up.state == kGWStreamClosed) {
+            char why[320];
+
+            session_fail(s, kUpstream502,
+                         upstream_why(s, "upstream proxy unreachable",
+                                      why, sizeof(why)));
+        }
+        return;
+    }
+
+    /* Send whatever the current phase has staged. */
+    if (s->ptxSent < s->ptxLen) {
+        n = GWStream_Write(&s->up, s->ptx + s->ptxSent,
+                           s->ptxLen - s->ptxSent);
+        if (n < 0) {
+            proxy_fail(s, "upstream proxy closed while being greeted");
+            return;
+        }
+        if (n == 0) return;                 /* flow-controlled, try next tick */
+        s->ptxSent += (size_t)n;
+        s->lastActivity = GWNet_Ticks();
+        if (s->ptxSent < s->ptxLen) return;
+
+        /* Fully staged: move to the reply that answers it. */
+        if (s->proxyPhase == GW_PX_SOCKS_GREET)
+            s->proxyPhase = GW_PX_SOCKS_REPLY;
+        else if (s->proxyPhase == GW_PX_SOCKS_CONN)
+            s->proxyPhase = GW_PX_SOCKS_ACK;
+        else
+            s->proxyPhase = GW_PX_HTTP_RECV;
+        s->prxLen = 0;
+    }
+
+    /* Read the reply. */
+    if (s->prxLen < sizeof(s->prx)) {
+        n = GWStream_Read(&s->up, s->prx + s->prxLen,
+                          sizeof(s->prx) - s->prxLen);
+        if (n < 0) {
+            proxy_fail(s, n == -2 ? "upstream proxy closed without answering"
+                                  : "upstream proxy read failed");
+            return;
+        }
+        if (n == 0) return;                 /* nothing yet */
+        s->prxLen += (size_t)n;
+        s->lastActivity = GWNet_Ticks();
+    }
+
+    switch (s->proxyPhase) {
+    case GW_PX_HTTP_RECV: {
+        size_t hlen = 0;
+        long   code = 0;
+        int    r = gw_fwd_connect_reply(s->prx, s->prxLen, &hlen, &code);
+
+        if (r == 0) { proxy_need_more(s); return; }
+        if (r < 0) {
+            proxy_fail(s, "upstream proxy did not answer the CONNECT");
+            return;
+        }
+        if (code != 200) {
+            /*
+             * Logged with the code and answered with a 502 rather than
+             * passed through as a 407. The browser would then be sending
+             * proxy credentials meant for *that* proxy to Gateway, which
+             * has nowhere to put them, and a prompt from a proxy the user
+             * did not know was there is a dead end. The code in the log is
+             * what the operator needs: 407 means the credentials in the
+             * prefs are wrong, anything else is the proxy's own business.
+             */
+            gw_log("#%ld upstream proxy refused CONNECT (%ld)", s->id, code);
+            proxy_fail(s, "upstream proxy refused the CONNECT request");
+            return;
+        }
+        proxy_link_up(s);
+        return;
+    }
+
+    case GW_PX_SOCKS_REPLY: {
+        int r = gw_fwd_socks_greet_reply((const unsigned char *)s->prx,
+                                         s->prxLen);
+
+        if (r == 0) { proxy_need_more(s); return; }
+        if (r < 0) {
+            proxy_fail(s, "upstream proxy refused the SOCKS greeting");
+            return;
+        }
+        n = (long)gw_fwd_socks_connect(s->upHost, s->upPort,
+                                       (unsigned char *)s->ptx, sizeof(s->ptx));
+        if (n == 0) {
+            proxy_fail(s, "cannot shape the SOCKS connect request");
+            return;
+        }
+        s->ptxLen = (size_t)n;
+        s->ptxSent = 0;
+        s->prxLen = 0;
+        s->proxyPhase = GW_PX_SOCKS_CONN;
+        return;
+    }
+
+    case GW_PX_SOCKS_ACK: {
+        int r = gw_fwd_socks_conn_reply((const unsigned char *)s->prx,
+                                        s->prxLen);
+
+        if (r == 0) { proxy_need_more(s); return; }
+        if (r < 0) {
+            /*
+             * REP is byte 1 of a SOCKS5 reply, and it is the whole
+             * diagnosis when the proxy is reachable but the host is not:
+             * 0x05 connection refused, 0x04 host unreachable, 0x03 network
+             * unreachable. Only meaningful while the reply still looks like
+             * one -- a wrong version byte puts nothing trustworthy there.
+             */
+            if (s->prxLen >= 2 && s->prx[0] == 0x05)
+                gw_log("#%ld upstream proxy refused the connection (REP %02x)",
+                       s->id, (unsigned)(unsigned char)s->prx[1]);
+            else
+                gw_log("#%ld upstream proxy sent a reply this is not SOCKS5",
+                       s->id);
+            proxy_fail(s, "upstream proxy refused to reach that host");
+            return;
+        }
+        proxy_link_up(s);
+        return;
+    }
+
+    default:
+        gw_log("#%ld upstream proxy handshake is in phase %d",
+               s->id, s->proxyPhase);
+        proxy_fail(s, "upstream proxy handshake lost its place");
+        return;
+    }
+}
+
 static void session_start_upstream(GWHttpSession *s)
 {
-    int ok;
-
     s->ureqLen = gw_http_build_upstream(&s->req, s->chead, s->req.head_len,
                                         s->ureq, GW_HEAD_MAX, 1);
     if (s->ureqLen == 0) {
@@ -737,18 +1162,7 @@ static void session_start_upstream(GWHttpSession *s)
 
     gw_log("#%ld opening a connection to %s", s->id, s->upHost);
 
-    if (s->req.url.tls)
-        ok = GWStream_ConnectTLS(&s->up, s->upHost, s->upPort);
-    else
-        ok = GWStream_ConnectPlain(&s->up, s->upHost, s->upPort);
-
-    if (!ok) {
-        session_fail(s, "HTTP/1.0 502 Bad Gateway\r\nConnection: close\r\n\r\n"
-                        "Gateway: could not start the upstream connection.\r\n",
-                     "upstream connect failed to start");
-        return;
-    }
-    s->state = kHPConnect;
+    upstream_open(s, kHPConnect, "upstream connect failed to start");
 }
 
 /*
@@ -766,12 +1180,13 @@ static int session_retry_fresh(GWHttpSession *s)
     s->ureqSent = 0;
     s->uheadLen = 0;
 
-    if (s->req.url.tls)
-        GWStream_ConnectTLS(&s->up, s->upHost, s->upPort);
-    else
-        GWStream_ConnectPlain(&s->up, s->upHost, s->upPort);
-
-    s->state = kHPConnect;
+    /*
+     * Take the connection over and say so regardless: upstream_open() fails
+     * into session_fail() on its own, and a caller that then reported the
+     * failure again would be closing an already-closed session. This is why
+     * the return is a plain 1 rather than its answer.
+     */
+    upstream_open(s, kHPConnect, "upstream reconnect failed to start");
     return 1;
 }
 
@@ -895,16 +1310,14 @@ static void step_recv_request(GWHttpSession *s)
                   strlen(s->req.url.host));
         s->upPort = s->req.url.port;
         s->upTls = 0;
-        if (!GWStream_ConnectPlain(&s->up, s->req.url.host, s->req.url.port)) {
-            session_fail(s, "HTTP/1.0 502 Bad Gateway\r\n"
-                            "Connection: close\r\n\r\n",
-                         "CONNECT upstream failed to start");
-            return;
-        }
-        /* Anything the client already sent past the request head is tunnel
-         * payload; keep it and forward it once the tunnel is up. */
+        /*
+         * Anything the client already sent past the request head is tunnel
+         * payload; keep it and forward it once the tunnel is up. Set before
+         * the dial because a proxy inserts a handshake state in front of
+         * kHPTunnelConnect, and both paths have to find it waiting.
+         */
         s->cheadSent = s->req.head_len;
-        s->state = kHPTunnelConnect;
+        upstream_open(s, kHPTunnelConnect, "CONNECT upstream failed to start");
         return;
     }
 
@@ -1867,10 +2280,14 @@ static void session_step(GWHttpSession *s)
      * will fail on its own and end the session, and a client that merely
      * half-closed still gets its answer. A CONNECT whose browser left while
      * its upstream was still connecting joins the list for the same reason:
-     * there is no response yet and nobody left to read one.
+     * there is no response yet and nobody left to read one. kHPProxyLink is
+     * kHPConnect wearing a different dialler -- still nothing sent, still
+     * nobody waiting for an answer, and with a proxy in the middle it is the
+     * state a session spends longest in.
      */
     if ((s->state == kHPConnect || s->state == kHPConnectWait ||
          s->state == kHPRetryWait || s->state == kHPSendRequest ||
+         s->state == kHPProxyLink ||
          s->state == kHPTunnelConnect) &&
          GWStream_PeerGone(&s->cli))
          s->state = kHPDone;
@@ -1914,6 +2331,10 @@ static void session_step(GWHttpSession *s)
             s->lastActivity = GWNet_Ticks();
             session_start_upstream(s);
         }
+        break;
+
+    case kHPProxyLink:
+        step_proxy_handshake(s);
         break;
 
     case kHPRetryWait:

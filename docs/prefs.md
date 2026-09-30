@@ -40,6 +40,11 @@ as confusing as it sounds, so heed the warning.
 | `connect_mitm` | `0` | Terminate TLS on the browser's side of a `CONNECT` **to port 443** instead of tunnelling, so a typed `https://` URL works. A `CONNECT` to any other port stays a raw tunnel, since nothing obliges it to be TLS — `git`, ssh through a proxy and anything else that just wants bytes moved are unaffected. Gateway generates its own certificate authority on first use and presents a certificate it signed for each host — so the browser warns until that authority is installed, and every byte is 3DES on the loopback hop, which is the only cipher IE 4 and BearSSL share. Leave it off unless you need the address bar or `Secure` cookies. |
 | `connect_upgrade` | `0` | Answer a `CONNECT` **to port 80** with `https` upstream: the plaintext request inside the tunnel is terminated as HTTP and re-originated over TLS to port 443, single-shot (one inner request per `CONNECT`, then the tunnel closes — which is what a downloader opening one connection per file already does). No certificate is presented to anyone, so this is protocol translation rather than MITM. Opt-in because a `CONNECT` carrying anything but HTTP breaks under it; with it off every such `CONNECT` stays a raw tunnel. Chunked client request bodies are not relayed; on `:8888` the inner request is archived like any other. |
 | `max_body_mb` | `0` | Ceiling on a relayed response body, in MiB. `0` means none, which is the default: bodies stream through a 32 KB buffer and are never held, so a limit truncates downloads without saving memory. |
+| `http_upstream` | `none` | The proxy Gateway reaches the web *through*, on both listeners (`:8765` and `:8888`). `none` dials each origin directly, exactly as before. `http` sends `CONNECT host:port HTTP/1.0` -- request line, optional `Proxy-Authorization`, no `Host`, which is the shape that never stalled on a proxy that answers the other one and then says nothing -- and waits for `200`. `socks5` sends the no-auth greeting, then the connection request. Read once at launch, so quit Gateway fully after changing it. A non-200 is logged with its code and answered to the browser as a `502`: a `407` would have the browser prompt for credentials that belong to the *other* proxy, which Gateway has nowhere to put. TLS to the origin still runs end to end inside the tunnel -- the proxy carries bytes and learns only the destination name. |
+| `http_upstream_host` | _(empty)_ | The upstream proxy's address. Required whenever `http_upstream` is not `none`. |
+| `http_upstream_port` | `8080` / `1080` | Its port, defaulting by kind: 8080 for `http`, 1080 for `socks5`. |
+| `http_upstream_user` | _(empty)_ | Username for `Proxy-Authorization: Basic`. Sent only by `http`; `socks5` has no login implemented, so a configured user with `socks5` fails loudly rather than connecting anonymously, which the log could not tell apart from a proxy that simply does not ask. Max 127 bytes. |
+| `http_upstream_pass` | _(empty)_ | Its password, also max 127 bytes. |
 
 ### What `rewrite_https` does not reach
 
@@ -123,6 +128,10 @@ which proxy it points at.
 | `wayback_quick_images` | `1` | Accepted for settings-page compatibility and does nothing. It tells the reference proxy to rewrite asset URLs in the HTML; Gateway fetches with the archive's `id_` modifier, which returns the original bytes with no HTML to rewrite. |
 | `wayback_cache` | `1` | Replace the archive's half-hour freshness with a year, since a snapshot cannot change. `0` passes the origin's caching through unaltered. |
 | `wayback_live` | — | Hosts to fetch live instead of from the archive. Repeat the key, one pattern per line. A plain host name covers the site and everything under it, so `frogfind.com` also matches `www.frogfind.com`; a pattern containing `*` or `?` is a glob and matches only what it says. Case-insensitive either way. A blank entry is skipped rather than ending the list. |
+
+The archive and the `wayback_live` hosts are reached through `http_upstream`
+as well: the setting belongs to the machine's route out, not to one port, so a
+site that is only reachable behind a corporate proxy is reachable in both eras.
 
 The era is changed from the browser, not from Gateway, by visiting the settings
 page on the Wayback port:
