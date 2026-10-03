@@ -814,7 +814,11 @@ static void proxy_link_up(GWHttpSession *s)
  * first.
  *
  * Returns 1 when a connection is under way and s->state is set -- to `next`,
- * or to kHPProxyLink when there is a handshake to get through first. Returns
+ * or to kHPProxyLink when there is a handshake to get through first. A
+ * plain-http request through an HTTP proxy is the third shape: no CONNECT
+ * (Squid denies it to non-SSL ports), just the request itself rebuilt in
+ * absolute-form and sent to the proxy, so `next` is reached with no
+ * handshake state in between. Returns
  * 0 when it could not start, having already failed the session; `directWhy`
  * is the reason logged for a plain direct dial, and is verbatim what the two
  * original call sites logged before there was anywhere to chain through.
@@ -944,6 +948,35 @@ static int upstream_open(GWHttpSession *s, GWHttpState next,
                 return 0;
             }
             auth = b64;
+        }
+
+        /*
+         * A plain-http request does not CONNECT. Squid's default config
+         * denies CONNECT to anything but SSL ports, which would turn every
+         * http:// page into a 502, so the request itself goes to the proxy
+         * in absolute-form -- which is what a forward proxy is for. CONNECT
+         * stays for TLS origins (below) and for CONNECT tunnels, which asked
+         * for a tunnel and get one.
+         */
+        if (!s->upTls && next != kHPTunnelConnect) {
+            n = gw_http_build_proxy_upstream(&s->req, s->chead,
+                                             s->req.head_len, s->ureq,
+                                             GW_HEAD_MAX, 1, auth);
+            if (n == 0) {
+                proxy_fail(s, "cannot shape the upstream proxy request");
+                return 0;
+            }
+            s->ureqLen = n;
+            s->ureqSent = 0;
+
+            gw_log("#%ld via upstream proxy %s:%ld (http absolute-form)",
+                   s->id, phost, pport);
+            if (!GWStream_ConnectPlain(&s->up, phost, (UInt16)pport)) {
+                proxy_fail(s, "upstream proxy connect failed to start");
+                return 0;
+            }
+            s->state = next;
+            return 1;
         }
 
         /*

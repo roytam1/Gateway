@@ -66,8 +66,20 @@ int gw_http_parse_request(const char *buf, size_t len, GWRequest *req);
  * Returns the number of bytes written, or 0 if it would not fit in cap.
  */
 size_t gw_http_build_upstream(const GWRequest *req,
-                              const char *client_head, size_t head_len,
-                              char *out, size_t cap, int keep_alive);
+                               const char *client_head, size_t head_len,
+                               char *out, size_t cap, int keep_alive);
+
+/*
+ * Absolute-form for sending a plain-http request to a forward HTTP proxy:
+ * "GET http://host/path ..." plus "Proxy-Authorization: Basic" when proxy_b64
+ * is not NULL. A CONNECT to a plain-http port is refused by Squid's default
+ * config, so this -- not gw_fwd_connect_req_bare -- is how plain origins go
+ * through an http upstream. Returns bytes written, or 0 on overflow.
+ */
+size_t gw_http_build_proxy_upstream(const GWRequest *req,
+                                    const char *client_head, size_t head_len,
+                                    char *out, size_t cap, int keep_alive,
+                                    const char *proxy_b64);
 
 typedef struct {
     int    status;

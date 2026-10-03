@@ -139,16 +139,74 @@ int gw_http_parse_request(const char *buf, size_t len, GWRequest *req)
     return 1;
 }
 
+static int append_port(char *out, size_t cap, size_t *used,
+                       int tls, unsigned port);
+static size_t build_upstream_inner(const GWRequest *req,
+                                   const char *client_head, size_t head_len,
+                                   char *out, size_t cap, int keep_alive,
+                                   int absolute, const char *proxy_b64);
+
 size_t gw_http_build_upstream(const GWRequest *req,
                               const char *client_head, size_t head_len,
                               char *out, size_t cap, int keep_alive)
 {
+    return build_upstream_inner(req, client_head, head_len,
+                                out, cap, keep_alive, 0, NULL);
+}
+
+/*
+ * Absolute-form for a forward HTTP proxy: the proxy reads the request line
+ * rather than the origin, so the target has to name the whole URL. A
+ * CONNECT to a plain-http port is not the way there -- Squid's default
+ * config denies CONNECT anywhere but SSL ports, which would turn every
+ * http:// page into a 502 -- so plain origins go over as a request and only
+ * TLS origins and CONNECT tunnels go over as a CONNECT.
+ */
+size_t gw_http_build_proxy_upstream(const GWRequest *req,
+                                    const char *client_head, size_t head_len,
+                                    char *out, size_t cap, int keep_alive,
+                                    const char *proxy_b64)
+{
+    return build_upstream_inner(req, client_head, head_len,
+                                out, cap, keep_alive, 1, proxy_b64);
+}
+
+static int append_port(char *out, size_t cap, size_t *used,
+                       int tls, unsigned port)
+{
+    if ((tls && port != 443) || (!tls && port != 80)) {
+        unsigned p = port;
+        int n = 0;
+        char tmp[8], portbuf[8];
+        int k;
+
+        do { tmp[n++] = (char)('0' + (p % 10)); p = p / 10; }
+        while (p != 0 && n < 7);
+        for (k = 0; k < n; k++) portbuf[k] = tmp[n - 1 - k];
+        portbuf[n] = '\0';
+        if (!appends(out, cap, &used, ":")) return 0;
+        if (!appends(out, cap, &used, portbuf)) return 0;
+    }
+    return 1;
+}
+
+static size_t build_upstream_inner(const GWRequest *req,
+                                   const char *client_head, size_t head_len,
+                                   char *out, size_t cap, int keep_alive,
+                                   int absolute, const char *proxy_b64)
+{
     size_t used = 0;
     size_t off;
-    char portbuf[8];
 
     if (!appends(out, cap, &used, req->method)) return 0;
     if (!appends(out, cap, &used, " ")) return 0;
+    if (absolute) {
+        if (!appends(out, cap, &used,
+                     req->url.tls ? "https://" : "http://")) return 0;
+        if (!appends(out, cap, &used, req->url.host)) return 0;
+        if (!append_port(out, cap, &used,
+                         req->url.tls, req->url.port)) return 0;
+    }
     if (!appends(out, cap, &used, req->url.path[0] ? req->url.path : "/"))
         return 0;
     if (!appends(out, cap, &used, keep_alive ? " HTTP/1.1\r\n"
@@ -156,22 +214,19 @@ size_t gw_http_build_upstream(const GWRequest *req,
 
     if (!appends(out, cap, &used, "Host: ")) return 0;
     if (!appends(out, cap, &used, req->url.host)) return 0;
-    if ((req->url.tls && req->url.port != 443) ||
-        (!req->url.tls && req->url.port != 80)) {
-        unsigned short p = req->url.port;
-        int n = 0;
-        char tmp[8];
-        do { tmp[n++] = (char)('0' + (p % 10)); p = (unsigned short)(p / 10); }
-        while (p != 0 && n < 7);
-        {
-            int k;
-            for (k = 0; k < n; k++) portbuf[k] = tmp[n - 1 - k];
-            portbuf[n] = '\0';
-        }
-        if (!appends(out, cap, &used, ":")) return 0;
-        if (!appends(out, cap, &used, portbuf)) return 0;
-    }
+    if (!append_port(out, cap, &used, req->url.tls, req->url.port)) return 0;
     if (!appends(out, cap, &used, "\r\n")) return 0;
+
+    /*
+     * Ours, not the client's: the relay loop below strips Proxy-Authorization
+     * as hop-by-hop, so these can never double up.
+     */
+    if (absolute && proxy_b64 != NULL && proxy_b64[0] != '\0') {
+        if (!appends(out, cap, &used, "Proxy-Authorization: Basic "))
+            return 0;
+        if (!appends(out, cap, &used, proxy_b64)) return 0;
+        if (!appends(out, cap, &used, "\r\n")) return 0;
+    }
 
     /* Relay the client's remaining headers, minus the hop-by-hop ones. */
     off = gw_next_line(client_head, head_len, 0);

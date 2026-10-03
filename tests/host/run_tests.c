@@ -209,6 +209,43 @@ static void test_request(void)
               "non-default port is kept in Host");
     }
 
+    /* Plain origin through an HTTP proxy: absolute-form, never CONNECT. */
+    {
+        static const char r[] =
+            "GET http://example.com/index.html HTTP/1.0\r\n"
+            "User-Agent: Classilla/9.3.4\r\n"
+            "Proxy-Authorization: Basic bG9vcGJhY2s=\r\n\r\n";
+        check(gw_http_parse_request(r, sizeof(r) - 1, &req) == 1, "proxy shape parses");
+
+        n = gw_http_build_proxy_upstream(&req, r, req.head_len, out, sizeof(out), 1, NULL);
+        check(n > 0, "absolute-form build succeeds");
+        out[n] = '\0';
+        check(strstr(out, "GET http://example.com/index.html HTTP/1.1\r\n") == out,
+              "proxy request uses absolute form");
+        check(strstr(out, "Proxy-Authorization") == NULL,
+              "client proxy auth is not relayed");
+
+        n = gw_http_build_proxy_upstream(&req, r, req.head_len, out, sizeof(out), 1, "dXNlcjpwYXNz");
+        check(n > 0, "authed proxy build succeeds");
+        out[n] = '\0';
+        check(strstr(out, "Proxy-Authorization: Basic dXNlcjpwYXNz\r\n") != NULL,
+              "upstream proxy auth is sent when configured");
+        check(strstr(out, "User-Agent: Classilla/9.3.4\r\n") != NULL,
+              "end-to-end headers survive the absolute rewrite");
+    }
+
+    /* Non-default port rides in the absolute target too. */
+    {
+        static const char r[] = "GET /page HTTP/1.1\r\nHost: origin.test:8080\r\n\r\n";
+        check(gw_http_parse_request(r, sizeof(r) - 1, &req) == 1, "proxy port shape parses");
+
+        n = gw_http_build_proxy_upstream(&req, r, req.head_len, out, sizeof(out), 1, NULL);
+        check(n > 0, "proxy port build succeeds");
+        out[n] = '\0';
+        check(strstr(out, "GET http://origin.test:8080/page HTTP/1.1\r\n") == out,
+              "non-default port rides in the absolute target");
+    }
+
     /* Incomplete and malformed. */
     {
         static const char partial[] = "GET http://a/ HTTP/1.0\r\nHost: a\r\n";
